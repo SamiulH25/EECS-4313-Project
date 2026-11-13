@@ -83,6 +83,12 @@ def reads_private(src: str, func: str) -> bool:
         if isinstance(node, ast.Attribute) and node.attr.startswith("_") and not (
                 node.attr.startswith("__") and node.attr.endswith("__")):
             return True
+        # getattr(obj, "_Class__field") / hasattr / vars-style access by name
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and \
+                node.func.id in ("getattr", "hasattr", "setattr") and len(node.args) >= 2 and \
+                isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str) and \
+                node.args[1].value.startswith("_") and not node.args[1].value.endswith("__"):
+            return True
     return False
 
 

@@ -1,0 +1,168 @@
+"""Run candidate test files in the workspace and classify each test's result."""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+import shlex
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+
+FORBIDDEN_MODULES = {"inspect", "os", "io", "pathlib", "importlib", "linecache", "dis", "subprocess", "shutil",
+                     "glob", "marshal", "ast", "tokenize", "pkgutil", "runpy", "sys", "gc", "ctypes", "mmap",
+                     "tempfile", "socket", "requests", "urllib", "threading", "multiprocessing"}
+FORBIDDEN_NAMES = {"open", "exec", "eval", "compile", "globals", "vars", "__import__", "breakpoint"}
+FORBIDDEN_ATTRS = {"__code__", "__file__", "__globals__", "__loader__", "__spec__", "__path__", "modules",
+                   "getsource", "getsourcelines", "read_text", "read_bytes", "co_code", "f_code"}
+
+CONFTEST = '''"""Make property-based tests deterministic so they behave the same on every run."""
+from hypothesis import HealthCheck, settings
+
+settings.register_profile("tagent", derandomize=True, database=None, deadline=None, max_examples=150,
+                          suppress_health_check=list(HealthCheck), print_blob=False)
+settings.load_profile("tagent")
+'''
+
+
+def static_problem(src: str) -> str:
+    """Why the evaluator would reject this file, or ''."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as error:
+        return f"syntax error on line {error.lineno}: {error.msg}"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            names = {(node.module or "").split(".")[0]}
+        else:
+            names = set()
+        hit = names & FORBIDDEN_MODULES
+        if hit:
+            return f"imports {sorted(hit)[0]} (not allowed)"
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+            return f"uses {node.id} (not allowed)"
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
+            return f"uses .{node.attr} (not allowed)"
+    return ""
+
+
+@dataclass
+class TestResult:
+    nodeid: str
+    outcome: str                 # passed / failed / skipped
+    text: str = ""
+    frames: list = field(default_factory=list)
+    crash: list | None = None
+    flaky: bool = False
+
+    @property
+    def name(self) -> str:
+        return self.nodeid.split("::")[-1]
+
+    @property
+    def func(self) -> str:
+        return self.name.split("[")[0]
+
+
+class Runner:
+    def __init__(self, env, workspace: Path, student_dir: Path, package: str):
+        self.env = env
+        self.ws = Path(workspace)
+        self.student_dir = Path(student_dir)
+        self.package = package
+
+    def ensure_conftest(self, folder: Path):
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "conftest.py").write_text(CONFTEST)
+
+    def run(self, rel_paths: list[str], seed: int = 1, timeout_per_test: float = 8.0,
+            command_timeout: int = 110) -> tuple[dict, str]:
+        """Run pytest on the given workspace-relative paths. Returns (records, raw output tail)."""
+        out = f".tagent_out_{uuid.uuid4().hex[:8]}.json"
+        paths = " ".join(shlex.quote(p) for p in rel_paths)
+        cmd = (f"TAGENT_OUT={out} TAGENT_SEED={seed} TAGENT_TIMEOUT={timeout_per_test} "
+               f"PYTHONPATH={shlex.quote(str(self.student_dir))}:. "
+               f"HYPOTHESIS_STORAGE_DIRECTORY=.hypothesis "
+               f"timeout {command_timeout} python -m pytest -q -p no:cacheprovider -p tagent.record_plugin "
+               f"--tb=short --rootdir . -c /dev/null {paths} 2>&1 | tail -30")
+        result = self.env.execute({"command": cmd}, timeout=command_timeout + 10)
+        path = self.ws / out
+        records = {}
+        if path.exists():
+            try:
+                records = json.loads(path.read_text())
+            except json.JSONDecodeError:
+                records = {}
+            path.unlink(missing_ok=True)
+        return records, result.get("output", "")[-3000:]
+
+    def results(self, rel_paths: list[str], repeats: int = 2) -> tuple[list[TestResult], list[str], str]:
+        """Run `repeats` times in different orders. Returns (tests, collection errors, output)."""
+        runs = []
+        output = ""
+        for i in range(repeats):
+            recs, output = self.run(rel_paths, seed=i + 1)
+            runs.append(recs)
+        first = runs[0] if runs else {}
+        collection = [v.get("text", k) for k, v in first.items() if k.startswith("<collection>")]
+        tests = []
+        for nodeid, rec in first.items():
+            if nodeid.startswith("<"):
+                continue
+            outcomes = {r.get(nodeid, {}).get("outcome") for r in runs}
+            tr = TestResult(nodeid, rec.get("outcome", "failed"), rec.get("text", ""), rec.get("frames", []),
+                            rec.get("crash"))
+            if len(outcomes) > 1:
+                tr.flaky = True
+                # Prefer a failure record when one run failed.
+                for r in runs:
+                    if r.get(nodeid, {}).get("outcome") == "failed":
+                        x = r[nodeid]
+                        tr.outcome, tr.text, tr.frames, tr.crash = "failed", x.get("text", ""), x.get("frames", []), x.get("crash")
+            tests.append(tr)
+        if not first and not collection:
+            collection = [output]
+        return tests, collection, output
+
+
+TEST_BUG_EXC = ("NameError", "SyntaxError", "ImportError", "ModuleNotFoundError", "UnboundLocalError",
+                "fixture", "IndentationError")
+
+
+def triage_auto(tr: TestResult, test_file: str, package: str) -> str:
+    """Classify a failing test without the model.
+
+    Returns 'drop' (the test itself is broken or unreliable) or 'judge' (looks like it may be a bug).
+    """
+    if tr.flaky:
+        return "drop"
+    text = tr.text or ""
+    if "TimeoutError" in text or "took too long" in text:
+        return "drop"
+    if tr.crash and len(tr.crash) >= 3:
+        msg = tr.crash[2] or ""
+        if any(msg.startswith(e) or f"{e}:" in msg.split("\n")[0] for e in TEST_BUG_EXC):
+            return "drop"
+        if "SourceAccessError" in msg:
+            return "drop"
+    # Where was the exception raised?  If the innermost frame is in the test file and it is not an
+    # assertion (or pytest.raises/fail), the test code itself crashed.
+    frames = tr.frames or []
+    if frames:
+        inner = frames[-1]
+        path = str(inner[0])
+        msg = (tr.crash[2] if tr.crash else "") or ""
+        in_test = path.endswith(Path(test_file).name)
+        in_pkg = (f"{package}/" in path or path.startswith(package))
+        if in_test and not in_pkg:
+            is_assert = msg.startswith("AssertionError") or msg.startswith("assert ") or "Failed: DID NOT RAISE" in msg \
+                or msg.startswith("Failed") or "Falsifying" in text
+            if not is_assert:
+                if re.match(r"(TypeError|AttributeError|KeyError|IndexError|ValueError)", msg) and \
+                        any(f"{package}/" in str(f[0]) for f in frames):
+                    return "judge"
+                return "drop"
+    return "judge"

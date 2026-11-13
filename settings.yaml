@@ -5,13 +5,11 @@ model:
     temperature: 0.6
     top_p: 0.95
     max_tokens: 8192
-    # ITERATION ONLY: pinned to PrimeIntellect for speed. Record runs use settings.course.yaml
-    # (cp settings.course.yaml settings.yaml). The graders use the course settings regardless.
     provider:
-      order:
-        - primeintellect
-      allow_fallbacks: false
+      sort: throughput
       require_parameters: true
+      quantizations:
+        - fp8
 
 limits:
   token_limit: 400000

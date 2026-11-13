@@ -14,7 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "student"))
+STUDENT = ROOT / "student"
+if "--student" in sys.argv:
+    STUDENT = Path(sys.argv[sys.argv.index("--student") + 1]).resolve()
+sys.path.insert(0, str(STUDENT))
 
 from minisweagent.environments.local import LocalEnvironment  # noqa: E402
 
@@ -36,6 +39,8 @@ def main():
     ap.add_argument("--projects", default=str(ROOT / "data/dev"))
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--out", default="replay")
+    ap.add_argument("--student", default=str(STUDENT))
+    ap.add_argument("--no-llm", action="store_true", help="skip every model call (tools only)")
     args = ap.parse_args()
     settings = load_settings()
     total = {"found": 0, "fa": 0, "bugs": 0}
@@ -46,16 +51,16 @@ def main():
             if c.get("command") is not None and c["tag"] not in recorded:
                 recorded[c["tag"]] = c["command"]
         ws = create_workspace(project)
-        env = LocalEnvironment(cwd=str(ws), env=toolbox.environment(ROOT / "student" / "tools"), timeout=120)
+        env = LocalEnvironment(cwd=str(ws), env=toolbox.environment(STUDENT / "tools"), timeout=120)
         out_dir = RUNS_DIR / args.out / project.name
         out_dir.mkdir(parents=True, exist_ok=True)
         task = Task(project.name, project.package, project.summary, ws, "tests_new", "", 400000, 120, 300,
-                    out_dir / "trajectory.json", ROOT / "student")
+                    out_dir / "trajectory.json", STUDENT)
         pipe = P.Pipeline(task, FakeModel(), env)
         orig_ask = pipe.llm.ask
 
         def ask(system, user, tag, _rec=recorded):
-            return _rec.get(tag)
+            return None if args.no_llm else _rec.get(tag)
         pipe.llm.ask = ask
         pipe.run()
         collect_tests(ws, out_dir / "tests_new")

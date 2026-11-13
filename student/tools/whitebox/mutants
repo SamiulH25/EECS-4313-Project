@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""mutants: find inputs your tests are missing, by mutating solution.py.
+
+Usage: mutants [--max N] [--all] [--dir tests]
+
+Makes small single-point changes to solution.py (swapped operators, off-by-one
+constants, negated conditions), runs your tests against each changed version, and
+lists the ones your tests cannot tell apart from the real solution. Those
+"survivors" are behaviours you have not pinned down yet: add one test per survivor
+whose expected value you read off the real solution.py.
+
+Options:
+  --max N      test at most N mutants (default 12, keeps the command fast)
+  --all        test every mutant (slow)
+  --dir D      folder with the test files (default tests)
+
+Requires a passing suite on the original solution before scoring any mutants.
+A survivor may be equivalent: add a test only when the change can affect legal inputs.
+"""
+
+import ast
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from _mutation import changed_line, generate_mutants
+
+MUTANT_TIMEOUT = 25
+TOTAL_BUDGET = 95
+
+
+def help_text() -> str:
+    return __doc__.strip()
+
+
+def runs_tests(folder: Path, tests: list[Path]) -> str:
+    """'killed' if the suite fails or hangs on this folder, 'survived' if it passes, else 'error'."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--no-header", "-x", "-p", "no:cacheprovider",
+             *[t.name for t in tests]],
+            cwd=folder, capture_output=True, text=True, timeout=MUTANT_TIMEOUT,
+            env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except subprocess.TimeoutExpired:
+        return "killed"
+    if result.returncode == 0:
+        return "survived"
+    if result.returncode == 1:
+        return "killed"
+    return "error"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(help_text())
+        return 0
+    limit = 12
+    tests_dir = Path("tests")
+    if "--max" in args:
+        limit = int(args[args.index("--max") + 1])
+    if "--all" in args:
+        limit = 0
+    if "--dir" in args:
+        tests_dir = Path(args[args.index("--dir") + 1])
+
+    source_path = Path("solution.py")
+    if not source_path.exists():
+        print("solution.py not found in this folder.")
+        return 1
+    tests = sorted(tests_dir.glob("test_*.py"))
+    if not tests:
+        print(f"No test files in {tests_dir}.")
+        return 1
+    defined = sum(path.read_text().count("def test") for path in tests)
+    if defined < 4:
+        print(f"Only {defined} test(s) written so far. Write your first tests, then run mutants again:")
+        print("with almost no tests, every mutant survives and the list tells you nothing.")
+        return 1
+
+    source = source_path.read_text()
+    mutants = generate_mutants(source, limit=limit)
+    if not mutants:
+        print("No mutants could be generated from solution.py.")
+        return 0
+    original = __import__("ast").unparse(__import__("ast").parse(source)).splitlines()
+
+    started = time.time()
+    survivors, killed, errors = [], 0, 0
+    test_names = [test.name for test in tests]
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        baseline = work / "baseline"
+        baseline.mkdir()
+        shutil.copy(source_path, baseline / "solution.py")
+        for test in tests:
+            shutil.copy(test, baseline / test.name)
+        if runs_tests(baseline, [baseline / name for name in test_names]) != "survived":
+            print("Original suite does not pass; no mutants scored. Run run_tests and fix the tests first.")
+            return 1
+        for index, mutant in enumerate(mutants):
+            if time.time() - started > TOTAL_BUDGET:
+                print(f"Stopped after {TOTAL_BUDGET}s; run --max N to bound the work.")
+                break
+            # A fresh folder per mutant: a stale solution.pyc from the previous write could
+            # otherwise make pytest import the previous mutant (same mtime second and size).
+            folder = work / f"m{index}"
+            folder.mkdir()
+            (folder / "solution.py").write_text(mutant.source)
+            for test in tests:
+                shutil.copy(test, folder / test.name)
+            outcome = runs_tests(folder, [folder / name for name in test_names])
+            if outcome == "survived":
+                survivors.append(mutant)
+            elif outcome == "killed":
+                killed += 1
+            else:
+                errors += 1
+
+    tested = killed + len(survivors) + errors
+    print(f"{tested} mutants tested, {killed} killed, {len(survivors)} survived, {errors} unusable")
+    for mutant in survivors:
+        line = changed_line(original, mutant.source.splitlines())
+        print(f"SURVIVOR {mutant.id}  {mutant.operator:18} original line {mutant.line}: {line}")
+    if survivors:
+        print("Add one test per survivor: pick an input that makes the real solution differ,")
+        print("run that input through solution.py, and assert the value it prints.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

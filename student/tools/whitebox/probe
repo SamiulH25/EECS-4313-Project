@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""probe: evaluate test-case expressions and save exact pytest assertions.
+
+Usage: probe --output tests/test_combined.py --max-calls 50 <<'EOF'
+[{"grid": [[1, 2]], "k": 2}, {"grid": [[3, 4]], "k": 0}]
+EOF
+   or: probe --output tests/test_combined.py '[{"grid": [[1, 2]], "k": 2}]'
+
+Input must be ONE restricted Python expression returning a list of dicts
+mapping parameter names to values (e.g. [{"nums": [1]*n, "k": 1} for n in [2, 4]]).
+Allowed: pure literals, data constructors/comprehensions, comb, gcd, isqrt.
+Forbidden: assignments, imports, print, files, attributes, generator scripts.
+When SPEC.md is present, recognizable explicit constraints (numeric bounds,
+equal lengths, same digit width, stated non-overlap) are checked before calls.
+With --output, probe triggers automatic verified submission when the suite has
+at least min(20, max-calls/2) tests and the batch had no errors OR saved at least
+10 new tests (rejected entries are then dropped). Unbalanced closing brackets
+are repaired when the repaired text is a valid list of dicts.
+Each call must finish within 1 s on solution.py; slower cases are rejected, and
+cases stop running after 30 s in total. Keep inputs to a few thousand elements.
+Before submitting, probe fills unused budget by searching for inputs shaped like the
+saved ones (random, edited, reordered, scaled) that kill local mutants, reach new
+branches/loop counts of solution.py, or add new input/output feature pairs.
+Parameters named by order or structure constraints are not rebuilt.
+A batch that does not submit prints an answer summary so you can vary outcomes.
+
+Options:
+  --output FILE  append tests directly to tests/test_*.py; creates the import automatically
+  --max-calls N  total generated-suite budget with --output (default 50)
+  --func NAME    solution method (default: first method of Solution)
+  --prefix TEXT  test name prefix (default: probe); --output avoids name collisions
+  --values-only  print argument -> value lines instead of tests (no --output)
+  --no-submit    with --output: save tests but never submit (early seed suite)
+
+--output skips duplicate inputs across existing files and saves valid cases even
+when other entries fail, then completes via run_tests --submit (see above).
+Without --output, a failed batch emits no partial tests.
+"""
+
+import argparse
+import ast
+import copy
+import inspect
+import os
+import signal
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+from _augment import augment
+from _case_expressions import CaseExpressionError, evaluate_cases
+from _input_constraints import compile_constraints
+from _log import Log, short
+
+CASE_SECONDS = 1.0  # evaluator reruns each test per mutant and under tracing, so keep cases cheap
+CASES_BUDGET_SECONDS = 30.0  # leaves room for checker + pytest inside the 120 s command limit
+MAX_TEST_CHARS = 100_000
+SUBMIT_MIN_SAVED = 10
+MIN_SUITE = 20  # auto-submit needs min(MIN_SUITE, max_calls // 2) saved tests
+AUGMENT_DEADLINE_SECONDS = 50.0  # from probe start; checker (20) + pytest (50) still fit in 120 s
+FILL_DEADLINE_SECONDS = 35.0  # --fill-only runs inside run_tests --submit, before its checker and pytest
+STARTED = time.monotonic()
+LOG = Log()  # streamed to $PROBE_LOG on every exit path when the local driver sets it
+
+
+class CaseTimeout(BaseException):
+    """BaseException so a solution's `except Exception` cannot swallow it."""
+
+
+def _expire(signum, frame):
+    raise CaseTimeout
+
+
+def call_with_limit(call, seconds=CASE_SECONDS):
+    start = time.monotonic()
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        value = call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    # shortcut: the alarm cannot interrupt one long C-level operation; this only rejects it afterwards.
+    if time.monotonic() - start > seconds:
+        raise CaseTimeout
+    return value
+
+
+
+def method_name(source: str) -> str:
+    """First method defined in class Solution."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ClassDef) and node.name == "Solution":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef):
+                    return item.name
+    return ""
+
+
+def canonical_repr(values):
+    """Signature binding already puts parameter names in a stable order."""
+    return repr(tuple(values.items()))
+
+
+def repair_brackets(text: str) -> str:
+    """Close brackets the way they were opened, cutting at the first mismatched closer."""
+    pairs = {"[": "]", "{": "}", "(": ")"}
+    stack, quote, escaped = [], None, False
+    for index, char in enumerate(text):
+        if quote:
+            escaped = char == "\\" and not escaped
+            if char == quote and not escaped:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in ")]}":
+            if not stack or stack[-1] != char:
+                return text[:index].rstrip().rstrip(",") + "".join(reversed(stack))
+            stack.pop()
+    return text.rstrip().rstrip(",") + "".join(reversed(stack))
+
+
+def answer_summary(values) -> str:
+    counts = Counter(repr(value)[:40] for value in values)
+    top, top_count = counts.most_common(1)[0]
+    text = f"Answers: {len(counts)} distinct of {len(values)}; most common {top} x{top_count}."
+    if len(values) >= 4 and top_count / len(values) >= 0.75:
+        text += " Most answers are identical: choose inputs that produce other outcomes."
+    return text
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--max-calls", type=int, default=50)
+    parser.add_argument("--func")
+    parser.add_argument("--prefix", default="probe")
+    parser.add_argument("--values-only", action="store_true")
+    parser.add_argument("--no-submit", action="store_true")
+    parser.add_argument("--fill-only", action="store_true", help=argparse.SUPPRESS)  # used by run_tests --submit
+    parser.add_argument("expression", nargs="?", help="case expression instead of stdin")
+    args = parser.parse_args()
+    values_only, prefix = args.values_only, args.prefix
+    if args.max_calls <= 0 or (args.output and values_only) or (args.no_submit and not args.output):
+        parser.error("--max-calls must be positive; --output cannot be used with --values-only; "
+                     "--no-submit requires --output")
+    if not prefix.isidentifier():
+        print("--prefix must be a Python identifier.", file=sys.stderr)
+        return 1
+
+    source = Path("solution.py").read_text()
+    func = args.func or method_name(source)
+    if not func:
+        print("No class Solution with a method found in solution.py.", file=sys.stderr)
+        return 1
+    namespace = {}
+    exec(compile(source, "solution.py", "exec"), namespace)
+    if "Solution" not in namespace:
+        print("Class Solution not found in solution.py.", file=sys.stderr)
+        return 1
+
+    solution_cls = namespace["Solution"]
+    try:
+        sig = inspect.signature(getattr(solution_cls(), func))
+    except Exception as error:
+        print(f"Failed to inspect method {func}: {error}", file=sys.stderr)
+        return 1
+
+    expected_params = list(sig.parameters.keys())
+    seen, names, count = set(), set(), 0
+    suite = []  # argument dicts of every saved test, for augmentation
+    if args.output:
+        if (args.output.resolve().parent != Path("tests").resolve()
+                or not args.output.name.startswith("test_") or args.output.suffix != ".py"):
+            parser.error("--output must be tests/test_*.py")
+        for path in Path("tests").glob("test_*.py"):
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError as error:
+                print(f"Fix {path} before appending: {error}", file=sys.stderr)
+                return 1
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.add(node.name)
+                    # shortcut: one unparametrized call per test; use runtime accounting if this changes.
+                    count += node.name.startswith("test")
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == func:
+                    try:
+                        pos_args = [ast.literal_eval(a) for a in node.args]
+                        kw_args = {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords if kw.arg is not None}
+                        bound = sig.bind(*pos_args, **kw_args)
+                        bound.apply_defaults()
+                        seen.add(canonical_repr(dict(bound.arguments)))
+                        suite.append(dict(bound.arguments))
+                    except (ValueError, SyntaxError, TypeError):
+                        pass
+    raw_input = "[]" if args.fill_only else (args.expression if args.expression is not None else sys.stdin.read())
+    LOG.tag = func
+    LOG(f"=== probe {'seed (--no-submit)' if args.no_submit else 'batch'} func={func} output={args.output} "
+        f"max_calls={args.max_calls} existing_tests={count} expression_chars={len(raw_input)}")
+    repaired = False
+    try:
+        cases = evaluate_cases(raw_input)
+    except CaseExpressionError as error:
+        fixed = repair_brackets(raw_input.strip())
+        try:
+            cases = evaluate_cases(fixed) if "Syntax error" in str(error) and fixed != raw_input.strip() else None
+        except CaseExpressionError:
+            cases = None
+        if not (isinstance(cases, list) and cases and all(isinstance(c, dict) for c in cases)):
+            print(f"Invalid case expression: {error}", file=sys.stderr)
+            LOG(f"rejected expression: {error} | tail: {raw_input.strip()[-80:]!r}")
+            return 1
+        repaired = True
+        LOG(f"repaired brackets after: {error}")
+
+    spec_path = Path("SPEC.md")
+    constraints = compile_constraints(spec_path.read_text() if spec_path.exists() else "")
+
+    if not isinstance(cases, list):
+        print("Invalid case expression: expected list of dicts", file=sys.stderr)
+        return 1
+
+    LOG(f"expression gave {len(cases) if isinstance(cases, list) else type(cases).__name__} cases")
+    out, errors, values = [], 0, []
+    diagnostics = ["Note: repaired unbalanced closing brackets; check the saved cases."] if repaired else []
+
+    def make_test(arguments, value):
+        """Test source with a fresh unique name, or None when it is too large."""
+        call_kwargs = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
+        index = count + len(out) + 1
+        while f"test_{prefix}_{index}" in names:
+            index += 1
+        test = f"def test_{prefix}_{index}():\n    assert Solution().{func}({call_kwargs}) == {value!r}\n"
+        if len(test) > MAX_TEST_CHARS:
+            return None
+        names.add(f"test_{prefix}_{index}")
+        return test
+    signal.signal(signal.SIGALRM, _expire)
+    cases_start = time.monotonic()
+    for number, data in enumerate(cases if isinstance(cases, list) else [], 1):
+        logged = len(diagnostics)
+        case_started = time.monotonic()
+        if args.output and count + len(out) >= args.max_calls:
+            diagnostics.append(f"Budget of {args.max_calls} reached; remaining inputs not executed.")
+            LOG(f"case {number}: {diagnostics[-1]}")
+            break
+        if time.monotonic() - cases_start > CASES_BUDGET_SECONDS:
+            diagnostics.append(f"Time budget of {CASES_BUDGET_SECONDS:g}s reached; remaining inputs not executed.")
+            LOG(f"case {number}: {diagnostics[-1]}")
+            break
+        if not isinstance(data, dict):
+            diagnostics.append(
+                f"Invalid input: expected dict mapping parameter names to values; expected parameters: {expected_params}"
+            )
+            errors += 1
+            LOG(f"case {number}: {diagnostics[-1]} | {short(data, 120)}")
+            continue
+        try:
+            bound = sig.bind(**data)
+            bound.apply_defaults()
+        except TypeError as error:
+            diagnostics.append(f"Invalid arguments ({error}); expected parameters: {expected_params}")
+            errors += 1
+            LOG(f"case {number}: {diagnostics[-1]} | {short(data, 120)}")
+            continue
+
+        key = canonical_repr(dict(bound.arguments))
+        if key in seen:
+            diagnostics.append(f"Duplicate skipped: {key}")
+            LOG(f"case {number}: duplicate | {short(data, 120)}")
+            continue
+        seen.add(key)
+
+        violation = constraints.violation(bound.arguments)
+        if violation:
+            diagnostics.append(f"Invalid input: {violation}")
+            errors += 1
+            LOG(f"case {number}: {diagnostics[-1]} | {short(data, 120)}")
+            continue
+
+        arguments = copy.deepcopy(dict(bound.arguments))  # before the call can mutate them
+        try:
+            value = call_with_limit(lambda: getattr(solution_cls(), func)(**bound.arguments))
+        except CaseTimeout:
+            diagnostics.append(f"Too slow: {func}(...) took over {CASE_SECONDS:g}s; use a smaller input.")
+            errors += 1
+            LOG(f"case {number}: {diagnostics[-1]} | {short(data, 120)}")
+            continue
+        except Exception as error:
+            diagnostics.append(f"Call {func}(...) raised {type(error).__name__}: {error}")
+            errors += 1
+            LOG(f"case {number}: {diagnostics[-1]} | {short(data, 120)}")
+            continue
+        if values_only:
+            out.append(f"{key} -> {value!r}")
+        else:
+            test = make_test(arguments, value)
+            if test is None:
+                diagnostics.append(f"Too large: test over {MAX_TEST_CHARS} characters; use a smaller input.")
+                errors += 1
+                continue
+            out.append(test)
+            suite.append(arguments)
+        values.append(value)
+        LOG(f"case {number}: saved in {(time.monotonic() - case_started) * 1000:.0f}ms | {short(arguments, 120)} "
+            f"-> {short(value, 40)}")
+
+    if args.output:
+        big_enough = count + len(out) >= min(MIN_SUITE, args.max_calls // 2)
+        submitting = (not args.no_submit and count + len(out) > 0 and big_enough
+                      and (errors == 0 or len(out) >= SUBMIT_MIN_SAVED))
+        if not args.no_submit and not big_enough and count + len(out) > 0:
+            diagnostics.append(f"Suite has only {count + len(out)} tests; send one more batch of at least "
+                               f"{min(MIN_SUITE, args.max_calls // 2) - count - len(out)} new cases to submit.")
+        if submitting or args.fill_only:
+            def admissible(arguments):
+                return canonical_repr(arguments) not in seen and not constraints.violation(arguments)
+            try:
+                extra = augment(source, func, solution_cls, suite, spec_path.read_text() if spec_path.exists() else "",
+                                admissible, call_with_limit, args.max_calls - count - len(out),
+                                STARTED + (FILL_DEADLINE_SECONDS if args.fill_only else AUGMENT_DEADLINE_SECONDS),
+                                log=LOG)
+            except Exception as error:
+                extra = []  # augmentation is optional; never block a verified submission
+                LOG(f"augment failed: {type(error).__name__}: {error}")
+            for arguments, value in extra:
+                test = make_test(arguments, value)
+                if test is not None:
+                    out.append(test)
+        if out:
+            args.output.parent.mkdir(exist_ok=True)
+            header = "" if args.output.exists() and args.output.stat().st_size else "from solution import Solution\n"
+            with args.output.open("a") as target:
+                target.write(header + "\n" + "\n".join(out))
+
+        total_suite = count + len(out)
+        LOG(f"batch: {len(out)} tests written, {errors} rejected, suite now {total_suite}; "
+            f"submit={'yes' if submitting else 'no'} (no_submit={args.no_submit}, big_enough={big_enough}, "
+            f"errors={errors}); answers: {answer_summary(values) if values else 'none'}")
+        if args.fill_only:
+            print(f"Filled {len(out)} tests into {args.output}.", file=sys.stderr)
+            return 0
+        if submitting:
+            LOG.flush()
+            sibling_run_tests = str(Path(__file__).resolve().parent / "run_tests")
+            try:
+                os.execv(sys.executable, [sys.executable, sibling_run_tests, "--submit", "--no-fill",
+                                          "--max-calls", str(args.max_calls)])
+            except OSError as error:
+                print(f"Failed to execute run_tests: {error}", file=sys.stderr)
+                return 1
+
+        for diag in diagnostics:
+            print(diag, file=sys.stderr)
+        if out:
+            print(f"Saved {len(out)} tests to {args.output}; {max(0, args.max_calls - total_suite)} calls remain.", file=sys.stderr)
+            if values:
+                print(answer_summary(values), file=sys.stderr)
+        if total_suite == 0:
+            print("No tests saved. Fix the input generator before attempting submission.", file=sys.stderr)
+            return 1
+        if args.no_submit:
+            print("Seed suite kept. Next: one probe batch without --no-submit; it submits.", file=sys.stderr)
+        else:
+            print(f"Next: run_tests --submit --max-calls {args.max_calls}", file=sys.stderr)
+        return 1 if errors else 0
+
+    if errors:
+        for diag in diagnostics:
+            print(diag, file=sys.stderr)
+        return 1
+    if not out:
+        for diag in diagnostics:
+            print(diag, file=sys.stderr)
+        print("No cases generated. Pipe an expression returning a list of parameter dicts.", file=sys.stderr)
+        return 1
+    for diag in diagnostics:
+        print(diag, file=sys.stderr)
+    print("\n".join(out).rstrip())
+    print(f"{len(out)} case(s) generated.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        status = main()
+    finally:
+        LOG.flush()
+    sys.exit(status)

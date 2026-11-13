@@ -39,6 +39,21 @@ Steps:
 5. Copy `REPORT_TEMPLATE.md` to `REPORT.md` and fill it in.
 6. Run `python -m testagent.package --run my-final --team <team>` and upload the zip.
 
+For one continuous local benchmark, use the driver instead of running the stages by hand:
+
+```bash
+python scripts/final_run.py --run my-final --workers 8
+```
+
+It freezes `student/` and `settings.yaml` into `runs/<run>/` (an existing run name is refused), gives
+each problem its own process group and the configured 900 s wall deadline (a blocked model call or
+retry is interrupted at that deadline), merges each finished problem immediately and evaluates all of
+them once at the end. `--only lcb-3487` is a smoke test. Launching pauses when the OpenRouter key
+balance cannot cover another per-problem reservation; problems it cannot start are reported as unrun
+and the exit code is nonzero. A timeout ends the local wait, not the provider's request, so spend can
+be understated; such usage files say `billing_uncertain`. `scripts/` is a local convenience and is not
+part of the graded submission, so local numbers are measurements, not the course's result.
+
 Be ready to run your final configuration live and to answer questions about your design.
 
 ## What you can change

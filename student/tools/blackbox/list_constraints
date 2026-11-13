@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 NUMBER = r"-?\d+(?:\s*\*\s*10\^\d+|\^\d+)?"
-PATTERN = re.compile(rf"({NUMBER})\s*<=?\s*(.+?)\s*<=?\s*({NUMBER})")
+PATTERN = re.compile(rf"({NUMBER})\s*(<=|<)\s*(.+?)\s*(<=|<)\s*({NUMBER})")
 
 
 def to_int(text: str) -> int:
@@ -23,7 +23,8 @@ def to_int(text: str) -> int:
         return int(base) * 10 ** int(exp)
     if "^" in text:
         base, exp = text.split("^")
-        return int(base) ** int(exp)
+        magnitude = abs(int(base)) ** int(exp)
+        return -magnitude if base.startswith("-") else magnitude
     return int(text)
 
 
@@ -37,9 +38,14 @@ def main() -> int:
         match = PATTERN.search(line)
         if not match:
             continue
-        low, name, high = to_int(match.group(1)), match.group(2).strip(), to_int(match.group(3))
+        low, left, name, right, high = match.groups()
+        low = to_int(low) + (left == "<")
+        high = to_int(high) - (right == "<")
+        if low > high:
+            continue
         found += 1
-        print(f"{name}: [{low}, {high}]  boundaries: {low}, {low + 1}, {high - 1}, {high}")
+        boundaries = sorted({low, min(low + 1, high), max(high - 1, low), high})
+        print(f"{name.strip()}: [{low}, {high}]  boundaries: {', '.join(map(str, boundaries))}")
     if not found:
         print("No numeric constraints found in SPEC.md.")
     return 0

@@ -7,30 +7,29 @@ instance_template: |
   # Task: black-box testing
 
   Write unit tests for the function described below. You do NOT have the implementation.
-  `solution.py` only contains a stub that raises NotImplementedError, so running the tests
-  will fail. That is expected. Your expected values must come from the specification only.
+  `solution.py` only contains a stub that raises NotImplementedError, so **never run pytest**:
+  it can never pass, and checking it teaches you nothing.
 
   {{spec}}
 
   ## Rules
 
-  - Write all tests in `{{test_file}}`.
-  - Import the code with `from solution import Solution` and call `Solution().{{func_name}}(...)`.
-  - Every test needs at least one assertion with an exact expected value from the specification.
-  - Do not read or modify files outside this folder.
-  - Do not import os, inspect, pathlib or similar modules in tests, and do not open files: the evaluator
-    rejects any test file that could read the code under test.
-  - Only the first {{max_calls}} calls to the function are measured, counted in file order. Put the most
-    important tests first.
+  - Write all tests in `{{test_file}}`. Import with `from solution import Solution`.
+  - One assertion per test with an exact expected value from the specification.
+  - Work each value out twice, by two different methods. If they disagree, drop that test. A wrong
+    value is deleted by the evaluator and still spends a call.
+  - Do not import os, inspect, pathlib or call open in tests.
+  - Only the first {{max_calls}} calls are measured, in file order. Write at most {{max_calls}} tests,
+    most likely to find a bug first.
+  - Write the file once; append later. Every command is re-read on the next step, so be brief.
 
-  ## Suggested approach
+  ## Steps
 
-  1. Read the specification and constraints carefully.
-  2. Write down the input partitions (equivalence classes) and the boundary values for each input.
-  3. Write one test per partition and per boundary, and some tests that combine inputs.
-  4. Work out each expected value by hand from the specification before writing it.
-  5. Check the file with `check_tests`.
-  6. When you are done, run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` as a separate command.
+  1. `list_constraints` for the numeric bounds.
+  2. Write `{{test_file}}` in one command. One input per equivalence class, plus: smallest and largest
+     input, the extremal legal argument, an all-equal input, a case where a loop runs zero times, and
+     the case where no valid answer exists (many problems return -1 or 0 there -- check the statement).
+  3. `check_tests --max-calls {{max_calls}}`, then run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
 
   ## Tools
 

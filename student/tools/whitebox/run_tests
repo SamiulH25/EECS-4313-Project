@@ -1,23 +1,136 @@
 #!/usr/bin/env python3
 """run_tests: run the tests in ./tests against solution.py and show a short report.
 
-Usage: run_tests [extra pytest arguments]
+Usage:
+  run_tests [extra pytest arguments]
+  run_tests --submit --max-calls N
 
-Example: run_tests -k empty
+Examples:
+  run_tests -k empty
+  run_tests --submit --max-calls 50
 """
 
+import argparse
+import os
+import signal
 import subprocess
 import sys
+from pathlib import Path
 
 MAX_CHARS = 6000
+CHECKER_TIMEOUT = 20
+FILL_TIMEOUT = 45  # fill (<=45) + checker (20) + pytest (50) fit the 120 s command limit
+PYTEST_TIMEOUT = 50  # probe (<=40 s) + checker + pytest must fit the 120 s command limit
+USE_POSIX = hasattr(os, "killpg") and hasattr(os, "setsid")
+PYTEST_COMMAND = [
+    sys.executable, "-m", "pytest", "tests", "-q", "--no-header", "-rfE",
+    "--tb=short", "-p", "no:cacheprovider",
+]
+
+
+def run_cmd(cmd: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=USE_POSIX,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        if USE_POSIX:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        else:
+            proc.kill()
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+
+
+def fill(max_calls: int) -> None:
+    """Let probe's search fill unused budget before verification; skipped silently on any failure."""
+    probe = Path(__file__).resolve().parent / "probe"
+    targets = [p for p in (Path("tests/test_combined.py"), Path("tests/test_whitebox.py")) if p.exists()]
+    if not probe.exists() or not targets:
+        return
+    try:
+        run_cmd([sys.executable, str(probe), "--output", str(targets[0]), "--max-calls", str(max_calls),
+                 "--fill-only"], timeout=FILL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def submit(max_calls: int, fill_first: bool = True) -> int:
+    if fill_first:
+        fill(max_calls)
+    checker = Path(__file__).resolve().parent.parent / "shared" / "check_tests"
+    if not checker.exists():
+        print(f"Error: checker not found at {checker}")
+        return 1
+
+    try:
+        check_res = run_cmd(
+            [sys.executable, str(checker), "--max-calls", str(max_calls)],
+            timeout=CHECKER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print("Error: check_tests timed out")
+        return 1
+
+    if check_res.returncode != 0:
+        out = (check_res.stdout + check_res.stderr).strip()
+        print(out)
+        return check_res.returncode or 1
+
+
+    try:
+        pytest_res = run_cmd(PYTEST_COMMAND, timeout=PYTEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print("Error: pytest timed out")
+        return 1
+
+    if pytest_res.returncode != 0:
+        out = (pytest_res.stdout + pytest_res.stderr).strip()
+        if len(out) > MAX_CHARS:
+            out = "...(output truncated)...\n" + out[-MAX_CHARS:]
+        print(out)
+        return pytest_res.returncode or 1
+
+    print("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")
+    out = (pytest_res.stdout + pytest_res.stderr).strip()
+    if len(out) > MAX_CHARS:
+        out = "...(output truncated)...\n" + out[-MAX_CHARS:]
+    if out:
+        print(out)
+    return 0
 
 
 def main() -> int:
     if "--help" in sys.argv[1:]:
         print(__doc__.strip())
         return 0
-    cmd = [sys.executable, "-m", "pytest", "tests", "-q", "--no-header", "-rfE", "--tb=short", "-p", "no:cacheprovider"]
-    result = subprocess.run(cmd + sys.argv[1:], capture_output=True, text=True, timeout=110)
+
+    if "--submit" in sys.argv[1:]:
+        parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        parser.add_argument("--submit", action="store_true", required=True)
+        parser.add_argument("--max-calls", type=int, required=True)
+        parser.add_argument("--no-fill", action="store_true", help=argparse.SUPPRESS)
+        args = parser.parse_args()
+        if args.max_calls <= 0:
+            parser.error("--max-calls must be positive")
+        return submit(args.max_calls, fill_first=not args.no_fill)
+
+    cmd = PYTEST_COMMAND
+    try:
+        result = run_cmd(cmd + sys.argv[1:], timeout=110)
+    except subprocess.TimeoutExpired:
+        print("Error: pytest timed out")
+        return 1
+
     output = (result.stdout + result.stderr).strip()
     if len(output) > MAX_CHARS:
         output = "...(output truncated)...\n" + output[-MAX_CHARS:]

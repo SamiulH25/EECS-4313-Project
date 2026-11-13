@@ -35,7 +35,8 @@ from .runner import CONFTEST, Runner, TestResult, static_problem, triage_auto
 WORKERS = 4
 JOB_RESERVE = 30_000        # do not start a unit job with fewer tokens left than this
 MAX_PER_LOCATION = 2        # kept tests per repaired location
-USE_JUDGE = False           # the LLM judge was too permissive; the repair check replaces it
+USE_JUDGE = False
+USE_BOUNDARY_VOTE = True           # the LLM judge was too permissive; the repair check replaces it
 MAX_TESTS = 300
 
 
@@ -107,6 +108,27 @@ def prune(src: str, keep: set[str]) -> str:
     return ast.unparse(tree) + "\n"
 
 
+_FLIPS = {("<", "<="), ("<=", "<"), (">", ">="), (">=", ">")}
+
+
+def is_boundary_flip(info: dict) -> bool:
+    """A comparison repair that only moves the boundary in or out (< vs <=, > vs >=)."""
+    if info.get("kind") != "comparison":
+        return False
+    orig, repl = info.get("orig", ""), (info.get("repl", "") or "").strip()
+    if repl.startswith("(") and repl.endswith(")"):
+        repl = repl[1:-1]
+    a = re.findall(r"<=|>=|==|!=|<|>", orig)
+    b = re.findall(r"<=|>=|==|!=|<|>", repl)
+    if len(a) != len(b) or not a:
+        return False
+    diff = [(x, y) for x, y in zip(a, b) if x != y]
+    if len(diff) != 1 or diff[0] not in _FLIPS:
+        return False
+    norm = lambda t: re.sub(r"\s+|[()]", "", re.sub(r"<=|>=|==|!=|<|>", "?", t))  # noqa: E731
+    return norm(orig) == norm(repl)
+
+
 class Pipeline:
     def __init__(self, task, model, env):
         self.task = task
@@ -117,6 +139,7 @@ class Pipeline:
         self.runner = Runner(env, self.ws, self.student, self.pkg)
         self.gen_prompt = _load_prompt(self.student / "prompts" / "generate.md")
         self.judge_prompt = _load_prompt(self.student / "prompts" / "judge.md")
+        self.boundary_prompt = _load_prompt(self.student / "prompts" / "boundary.md")
         self.cand = self.ws / "_cand"
         self.runner.ensure_conftest(self.cand)
         self.lock = threading.Lock()
@@ -126,6 +149,7 @@ class Pipeline:
         self.history: dict[str, list[str]] = {}   # unit uid -> notes for later rounds
         self.fixes: list[str] = []                # accepted repair sites (approximates the correct code)
         self.guards: list[str] = []               # passing tests that a trusted repair must keep passing
+        self.arcs: dict[str, set] = {}            # package file -> executed (from_line, to_line) arcs
         self.max_tests = getattr(task, "max_tests", MAX_TESTS) or MAX_TESTS
 
     # ------------------------------------------------------------------ phase 1: doc examples
@@ -203,6 +227,41 @@ class Pipeline:
         for t in threads:
             t.join()
 
+    def uncovered(self, u) -> list[str]:
+        """Branch outcomes in the unit that no generated test has exercised (coverage-guided rounds)."""
+        with self.lock:
+            arcs = set(self.arcs.get(u.path, set()))
+        if not arcs:
+            return []
+        lines = {b for _, b in arcs} | {a for a, _ in arcs}
+        try:
+            text = (self.ws / u.path).read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError):
+            return []
+        src = text.splitlines()
+        out = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.If, ast.While)) or not any(a <= node.lineno <= b for a, b in u.spans):
+                continue
+            test_lines = set(range(node.test.lineno, node.test.end_lineno + 1))
+            body = set(range(node.body[0].lineno, node.body[-1].end_lineno + 1))
+            cond = src[node.lineno - 1].strip()[:90]
+            if not test_lines & lines:
+                out.append(f"L{node.lineno}: `{cond}` is never reached")
+                continue
+            true_taken = node.body[0].lineno in lines
+            false_taken = any(a in test_lines and b not in body and b not in test_lines for a, b in arcs)
+            if not true_taken:
+                out.append(f"L{node.lineno}: `{cond}` is never true")
+            elif not false_taken:
+                out.append(f"L{node.lineno}: `{cond}` is never false")
+        for r in u.risks:
+            m = re.match(r"L(\d+):", r)
+            if m and int(m.group(1)) not in lines and not any(o.startswith(f"L{m.group(1)}:") for o in out):
+                out.append(f"{r.split(' -> ')[0]} is never executed")
+        return out[:25]
+
     def _gen_user(self, u, rnd: int, rel: str) -> str:
         prev = ""
         notes = self.history.get(u.uid) or []
@@ -210,6 +269,11 @@ class Pipeline:
             prev = ("\n## Tests already written for this unit in earlier rounds\n"
                     "Do not repeat them; target other methods, other risk points and other boundaries.\n"
                     + "\n".join(notes[-40:]) + "\n")
+        gaps = self.uncovered(u) if rnd > 1 else []
+        if gaps:
+            prev += ("\n## Branches and risk points that NO test has exercised yet (coverage)\n"
+                     "Write tests that drive these, with expected values from the documentation:\n"
+                     + "\n".join(f"- {g}" for g in gaps) + "\n")
         return _fill(self.gen_prompt[1], project=self.task.project, summary=self.task.summary, title=u.title,
                      import_hint=u.import_hint,
                      docs=inventory.docs_for(u, self.sections) or "(none found)",
@@ -265,7 +329,7 @@ class Pipeline:
             body = self._with_imports(u, body)
         path = self.ws / rel
         path.write_text(body)
-        tests, coll, out = self.runner.results([rel], repeats=2)
+        tests, coll, out = self.runner.results([rel], repeats=2, coverage=self.arcs)
         broken = [t for t in tests if t.outcome == "failed" and triage_auto(t, rel, self.pkg) == "drop"]
         if coll or (tests and len(broken) >= max(2, len(tests) // 2)):
             problem = "\n".join(coll)[-2500:] if coll else (
@@ -276,7 +340,7 @@ class Pipeline:
                 return
             body = self._with_imports(u, fixed)
             path.write_text(body)
-            tests, coll, out = self.runner.results([rel], repeats=2)
+            tests, coll, out = self.runner.results([rel], repeats=2, coverage=self.arcs)
             if coll:
                 return
         failing = [t for t in tests if t.outcome == "failed"]
@@ -285,7 +349,7 @@ class Pipeline:
         self._add_guards(rel, tests)
         self.llm.note("ran", file=rel, tests=len(tests), passed=len(passed), failing=len(failing),
                       candidates=[t.name for t in cands])
-        keep, located = self.verify(rel, cands)
+        keep, located = self.verify(rel, cands, unit=u)
         verdicts = {}
         if USE_JUDGE and keep:
             judged = [t for t in cands if t.func in keep]
@@ -328,7 +392,7 @@ class Pipeline:
         out.unlink(missing_ok=True)
         return res
 
-    def verify(self, rel: str, cands: list[TestResult], cap: bool = True) -> tuple[set[str], dict]:
+    def verify(self, rel: str, cands: list[TestResult], cap: bool = True, unit=None) -> tuple[set[str], dict]:
         """Keep failing tests that a single small repair (on top of the repairs accepted so far) makes
         pass without breaking the existing suite. Returns (kept function names, name -> site)."""
         if not cands:
@@ -354,6 +418,19 @@ class Pipeline:
         self.llm.note("repair", file=rel, notes=res.get("notes"), explained=res.get("explained"),
                       baseline_passing=[t for t, ok in (res.get("baseline") or {}).items() if ok])
         keep, located = set(), {}
+        # Boundary flips (< vs <=) are where the model most often guesses wrongly at an undocumented
+        # edge: ask several independent focused questions before trusting one.
+        votes: dict[str, bool] = {}
+        if unit is not None and USE_BOUNDARY_VOTE:
+            for tid in by_id:
+                sites = (res.get("explained") or {}).get(tid) or []
+                if (res.get("baseline") or {}).get(tid) or not sites:
+                    continue
+                infos = [(res.get("sites") or {}).get(x) or {} for x in sites]
+                if all(is_boundary_flip(i) for i in infos):
+                    key = sites[0]
+                    if key not in votes:
+                        votes[key] = self.boundary_vote(unit, infos[0])
         with self.lock:
             for tid, t in by_id.items():
                 if (res.get("baseline") or {}).get(tid):
@@ -361,6 +438,8 @@ class Pipeline:
                 else:
                     sites = (res.get("explained") or {}).get(tid) or []
                 if not sites:
+                    continue
+                if votes.get(sites[0]) is False:
                     continue
                 site = sites[0]
                 loc = ":".join(site.split(":", 3)[:3])
@@ -373,6 +452,52 @@ class Pipeline:
                 if site != "(earlier repair)" and len(sites) == 1 and not self._overlaps(site):
                     self.fixes.append(site)
         return keep, located
+
+    def boundary_vote(self, u, info: dict) -> bool:
+        """True when at least 2 of 3 independent questions say the repaired comparison is intended."""
+        file = self.ws / info.get("file", "")
+        if not file.exists():
+            return True
+        lines = file.read_text(encoding="utf-8", errors="replace").splitlines()
+        ln = int(info.get("line", 0))
+        if not 1 <= ln <= len(lines):
+            return True
+        current = lines[ln - 1].strip()
+        orig, repl = info.get("orig", ""), info.get("repl", "")
+        changed = current.replace(orig, repl.strip("()") if repl.startswith("(") else repl, 1) \
+            if orig and orig in current else repl
+        if changed == current:
+            return True
+        a, b = max(1, ln - 14), min(len(lines), ln + 6)
+        context = "\n".join(f"{i:4d}| {lines[i - 1]}" for i in range(a, b + 1))
+        names = set(re.findall(r"[A-Za-z_]\w{2,}", orig)) - {"self", "None", "True", "False", "not", "and"}
+        sib = [f"{i:4d}| {t.strip()}" for i, t in enumerate(lines, 1)
+               if i != ln and re.search(r"[<>]=?|==", t) and names & set(re.findall(r"[A-Za-z_]\w{2,}", t))
+               and not t.strip().startswith("#")][:14]
+        docs = inventory.docs_for(u, self.sections, 3000) or "(none found)"
+        questions = [
+            "Which version is the intended behaviour at the exact boundary value?",
+            "Which version is consistent with what the documentation says happens at the boundary?",
+            "A reviewer thinks one version is an injected off-by-one bug. Which version is the CORRECT one?",
+        ]
+        yes = no = 0
+        for k, q in enumerate(questions):
+            swap = k % 2 == 1                     # alternate the order to cancel position bias
+            va, vb = (changed, current) if swap else (current, changed)
+            user = _fill(self.boundary_prompt[1], project=self.task.project, summary=self.task.summary,
+                         docs=docs, file=info.get("file", ""), line=ln, context=context,
+                         siblings="\n".join(sib) or "(none)", a=va, b=vb, question=q)
+            cmd = self.llm.ask(self.boundary_prompt[0], user, f"vote:{info.get('file')}:{ln}:{k}") or ""
+            m = re.search(r"VERDICT:\s*(A|B|UNSURE)", cmd.upper())
+            pick = m.group(1) if m else "UNSURE"
+            if pick == ("A" if swap else "B"):
+                yes += 1
+            else:
+                no += 1
+            if yes >= 2 or no >= 2:
+                break
+        self.llm.note("vote", file=info.get("file"), line=ln, current=current, changed=changed, yes=yes, no=no)
+        return yes >= 2
 
     def _add_guards(self, rel: str, tests: list[TestResult]):
         with self.lock:

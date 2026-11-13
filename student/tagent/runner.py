@@ -79,14 +79,17 @@ class Runner:
         (folder / "conftest.py").write_text(CONFTEST)
 
     def run(self, rel_paths: list[str], seed: int = 1, timeout_per_test: float = 8.0,
-            command_timeout: int = 110) -> tuple[dict, str]:
+            command_timeout: int = 110, coverage: bool = False) -> tuple[dict, str]:
         """Run pytest on the given workspace-relative paths. Returns (records, raw output tail)."""
         out = f".tagent_out_{uuid.uuid4().hex[:8]}.json"
+        cov_out = out.replace("_out_", "_cov_")
         paths = " ".join(shlex.quote(p) for p in rel_paths)
-        cmd = (f"TAGENT_OUT={out} TAGENT_SEED={seed} TAGENT_TIMEOUT={timeout_per_test} "
+        cov = (f"TAGENT_COV_PKG={shlex.quote(self.package)} TAGENT_COV_OUT={cov_out} " if coverage else "")
+        plugin = "-p tagent.cov_plugin " if coverage else ""
+        cmd = (f"{cov}TAGENT_OUT={out} TAGENT_SEED={seed} TAGENT_TIMEOUT={timeout_per_test} "
                f"PYTHONPATH={shlex.quote(str(self.student_dir))}:. "
                f"HYPOTHESIS_STORAGE_DIRECTORY=.hypothesis "
-               f"timeout {command_timeout} python -m pytest -q -p no:cacheprovider -p tagent.record_plugin "
+               f"timeout {command_timeout} python -m pytest -q -p no:cacheprovider -p tagent.record_plugin {plugin}"
                f"--tb=short --rootdir . -c /dev/null {paths} 2>&1 | tail -30")
         result = self.env.execute({"command": cmd}, timeout=command_timeout + 10)
         path = self.ws / out
@@ -97,14 +100,27 @@ class Runner:
             except json.JSONDecodeError:
                 records = {}
             path.unlink(missing_ok=True)
+        self.last_coverage = {}
+        cpath = self.ws / cov_out
+        if cpath.exists():
+            try:
+                self.last_coverage = json.loads(cpath.read_text())
+            except json.JSONDecodeError:
+                pass
+            cpath.unlink(missing_ok=True)
         return records, result.get("output", "")[-3000:]
 
-    def results(self, rel_paths: list[str], repeats: int = 2) -> tuple[list[TestResult], list[str], str]:
-        """Run `repeats` times in different orders. Returns (tests, collection errors, output)."""
+    def results(self, rel_paths: list[str], repeats: int = 2, coverage: dict | None = None
+                ) -> tuple[list[TestResult], list[str], str]:
+        """Run `repeats` times in different orders. Returns (tests, collection errors, output).
+        If `coverage` is a dict, the first run's executed arcs are merged into it."""
         runs = []
         output = ""
         for i in range(repeats):
-            recs, output = self.run(rel_paths, seed=i + 1)
+            recs, output = self.run(rel_paths, seed=i + 1, coverage=(coverage is not None and i == 0))
+            if coverage is not None and i == 0:
+                for f, arcs in (self.last_coverage or {}).items():
+                    coverage.setdefault(f, set()).update(tuple(a) for a in arcs)
             runs.append(recs)
         first = runs[0] if runs else {}
         collection = [v.get("text", k) for k, v in first.items() if k.startswith("<collection>")]

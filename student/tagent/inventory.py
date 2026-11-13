@@ -341,6 +341,10 @@ def build_units(workspace: Path, package: str) -> list[Unit]:
 
 # ---------------------------------------------------------------- documentation and existing tests
 
+_NOISE = re.compile(r"^\s*(\.\. (image|figure)::|:target:|:alt:|:width:|:height:|\.\. _[^:]+: http)")
+_DIRECTIVE = re.compile(r"^\s*\.\.\s+(?:auto|py:)?(?:class|function|method|decorator|attribute|data|exception|module)::\s*([\w.]+)", re.M)
+
+
 def doc_sections(workspace: Path) -> list[tuple[str, str]]:
     files = [p for p in Path(workspace).glob("*") if p.suffix.lower() in (".rst", ".md", ".txt") and p.is_file()]
     d = Path(workspace) / "docs"
@@ -348,12 +352,15 @@ def doc_sections(workspace: Path) -> list[tuple[str, str]]:
         files += [p for p in d.rglob("*") if p.suffix.lower() in (".rst", ".md", ".txt")]
     sections = []
     for p in sorted(files):
+        if p.name.lower().startswith(("changes", "changelog", "history", "license", "authors", "contributing")):
+            continue
         text = p.read_text(encoding="utf-8", errors="replace")
-        # split on blank-line separated paragraphs, then regroup into ~900 char sections
+        text = "\n".join(line for line in text.splitlines() if not _NOISE.match(line))
         paras = re.split(r"\n\s*\n", text)
         cur = ""
         for para in paras:
-            if len(cur) + len(para) > 900 and cur:
+            starts_api = bool(_DIRECTIVE.match(para))
+            if cur and (len(cur) + len(para) > 900 or starts_api):
                 sections.append((p.name, cur))
                 cur = ""
             cur += para.strip("\n") + "\n\n"
@@ -362,29 +369,43 @@ def doc_sections(workspace: Path) -> list[tuple[str, str]]:
     return sections
 
 
-def docs_for(unit: Unit, sections: list[tuple[str, str]], budget_chars: int = 2600) -> str:
+def docs_for(unit: Unit, sections: list[tuple[str, str]], budget_chars: int = 4500) -> str:
     keys = [unit.cls] if unit.cls else []
-    keys += [m for m in unit.members if not m.startswith("__")]
-    keys = [k for k in keys if k and len(k) > 2]
+    keys += [m for m in unit.members if not m.startswith("_")]
+    keys += [m.strip("_") for m in unit.members if m.startswith("__") and m.endswith("__")]
+    keys = [k for k in dict.fromkeys(keys) if k and len(k) > 2]
     if not keys:
         return ""
     scored = []
     for i, (name, sec) in enumerate(sections):
-        score = 0
+        score = 0.0
         for k in keys:
             n = len(re.findall(rf"\b{re.escape(k)}\b", sec))
             score += n * (3 if k == unit.cls else 1)
+        named = {m.split(".")[-1] for m in _DIRECTIVE.findall(sec)}
+        if named & set(keys):
+            score += 12
+        if re.search(rf"^\s*\.\.\s+(?:py:)?(?:auto)?module::\s*{re.escape(unit.module)}\s*$", sec, re.M):
+            score += 15                  # the module's introduction explains its shared conventions
         if score:
             scored.append((score, i, name, sec))
     scored.sort(key=lambda t: (-t[0], t[1]))
-    out, used = [], 0
-    for _, i, name, sec in scored:
-        if used + len(sec) > budget_chars:
-            continue
-        out.append((i, f"[{name}]\n{sec.strip()}"))
-        used += len(sec)
-    out.sort()
-    return "\n\n".join(s for _, s in out)
+    chosen: dict[int, str] = {}
+    used = 0
+    for score, i, name, sec in scored:
+        group = [i]
+        if {m.split(".")[-1] for m in _DIRECTIVE.findall(sec)} & set(keys) and i + 1 < len(sections) \
+                and sections[i + 1][0] == name and not _DIRECTIVE.match(sections[i + 1][1]):
+            group.append(i + 1)          # the paragraphs that follow an API directive explain it
+        for j in group:
+            if j in chosen:
+                continue
+            text = sections[j][1]
+            if used + len(text) > budget_chars:
+                continue
+            chosen[j] = f"[{sections[j][0]}]\n{text.strip()}"
+            used += len(text)
+    return "\n\n".join(chosen[j] for j in sorted(chosen))
 
 
 def existing_tests_for(workspace: Path, unit: Unit, max_lines: int = 45) -> str:

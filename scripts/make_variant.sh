@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Dev only: make an ablation copy of student/ with one technique switched off.
+# Usage: scripts/make_variant.sh no-doctests|no-repair-filter   -> student_variants/<name>
+set -euo pipefail
+name="$1"
+dest="student_variants/$name"
+rm -rf "$dest"; mkdir -p student_variants
+cp -r student "$dest"
+case "$name" in
+  no-doctests)      sed -i 's/^USE_DOCTESTS = True/USE_DOCTESTS = False/' "$dest/tagent/pipeline.py" ;;
+  no-repair-filter) sed -i 's/^USE_REPAIR_FILTER = True/USE_REPAIR_FILTER = False/' "$dest/tagent/pipeline.py" ;;
+  *) echo "unknown variant $name"; exit 1 ;;
+esac
+grep -n "^USE_" "$dest/tagent/pipeline.py"

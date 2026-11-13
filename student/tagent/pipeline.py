@@ -35,8 +35,11 @@ from .runner import salvage, CONFTEST, Runner, TestResult, static_problem, triag
 WORKERS = 4
 JOB_RESERVE = 30_000        # do not start a unit job with fewer tokens left than this
 MAX_PER_LOCATION = 2        # kept tests per repaired location
-USE_JUDGE = False
-USE_BOUNDARY_VOTE = False   # the 9B model voted the wrong way; sibling evidence is used instead           # the LLM judge was too permissive; the repair check replaces it
+USE_JUDGE = False           # the LLM judge was too permissive; the repair check replaces it
+USE_BOUNDARY_VOTE = False   # the 9B model voted the wrong way; sibling evidence is used instead
+# Technique switches (turned off only in ablation copies made by scripts/make_variant.sh)
+USE_DOCTESTS = True         # mine documentation examples into one-check tests
+USE_REPAIR_FILTER = True    # keep a failing test only if a single small code repair explains it
 MAX_TESTS = 300
 
 
@@ -431,6 +434,8 @@ class Pipeline:
         pass without breaking the existing suite. Returns (kept function names, name -> site)."""
         if not cands:
             return set(), {}
+        if not USE_REPAIR_FILTER:            # ablation: every auto-triaged failing test is kept
+            return {t.func for t in cands}, {t.func: "(unchecked)" for t in cands}
         ids = [f"{rel}::{t.nodeid.split('::', 1)[1]}" if "::" in t.nodeid else t.nodeid for t in cands]
         by_id = dict(zip(ids, cands))
         res = {"baseline": {}, "explained": {}, "sites": {}, "notes": []}
@@ -657,7 +662,8 @@ class Pipeline:
     def run(self):
         try:
             try:
-                self.doctest_phase()
+                if USE_DOCTESTS:
+                    self.doctest_phase()
             except Exception as error:  # noqa: BLE001
                 self.llm.note("doctest-error", error=f"{error}\n{traceback.format_exc()[-1500:]}")
             try:

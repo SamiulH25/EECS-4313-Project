@@ -15,8 +15,12 @@
 from __future__ import annotations
 
 import ast
+import json
 import queue
 import re
+import shlex
+import textwrap
+import uuid
 import threading
 import traceback
 from collections import Counter
@@ -30,7 +34,8 @@ from .runner import CONFTEST, Runner, TestResult, static_problem, triage_auto
 
 WORKERS = 4
 JOB_RESERVE = 30_000        # do not start a unit job with fewer tokens left than this
-MAX_PER_LOCATION = 3        # kept tests per suspected faulty method
+MAX_PER_LOCATION = 2        # kept tests per repaired location
+USE_JUDGE = False           # the LLM judge was too permissive; the repair check replaces it
 MAX_TESTS = 300
 
 
@@ -64,6 +69,20 @@ def _functions(src: str) -> dict[str, str]:
                 start = min([n.lineno] + [d.lineno for d in n.decorator_list])
                 out.setdefault(n.name, "\n".join(lines[start - 1:n.end_lineno]))
     return out
+
+
+def reads_private(src: str, func: str) -> bool:
+    """True if the test (or a helper it defines) reads a private attribute such as obj._x."""
+    code = textwrap.dedent(_functions(src).get(func, ""))
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_") and not (
+                node.attr.startswith("__") and node.attr.endswith("__")):
+            return True
+    return False
 
 
 def prune(src: str, keep: set[str]) -> str:
@@ -105,6 +124,8 @@ class Pipeline:
         self.sources: dict[str, str] = {}         # candidate file -> source
         self.location_count: Counter = Counter()
         self.history: dict[str, list[str]] = {}   # unit uid -> notes for later rounds
+        self.fixes: list[str] = []                # accepted repair sites (approximates the correct code)
+        self.guards: list[str] = []               # passing tests that a trusted repair must keep passing
         self.max_tests = getattr(task, "max_tests", MAX_TESTS) or MAX_TESTS
 
     # ------------------------------------------------------------------ phase 1: doc examples
@@ -119,7 +140,14 @@ class Pipeline:
             return
         tests, coll, _ = self.runner.results([rel], repeats=3)
         failing = [t for t in tests if t.outcome == "failed"]
-        keep = {t.func for t in failing if triage_auto(t, rel, self.pkg) == "judge"}
+        cands = [t for t in failing if triage_auto(t, rel, self.pkg) == "judge"]
+        keep = {t.func for t in cands}
+        self._add_guards(rel, tests)
+        # Documented examples are trusted oracles; the repair check here only seeds the repairs.
+        try:
+            self.verify(rel, cands, cap=False)
+        except Exception as error:  # noqa: BLE001
+            self.llm.note("doctest-repair-error", error=str(error))
         self.llm.note("doctests", mined=n, ran=len(tests), failing=len(failing), kept=sorted(keep),
                       collection=coll[:1])
         if keep:
@@ -198,53 +226,154 @@ class Pipeline:
                 f"Reply with exactly one bash tool call:\ncat > {rel} <<'EOF'\n<the complete file>\nEOF")
         return heredoc_body(self.llm.ask(self.gen_prompt[0], user, f"repair:{rel}"))
 
+    def _with_imports(self, u, body: str) -> str:
+        """Make sure the unit (and the package's public names) are importable in the test file."""
+        lines = []
+        if u.import_hint and "..." not in u.import_hint and u.import_hint not in body:
+            lines.append(u.import_hint)
+        if f"from {self.pkg} import *" not in body:
+            lines.append(f"from {self.pkg} import *  # noqa: F401,F403")
+        if not lines:
+            return body
+        # keep a leading module docstring / __future__ imports first
+        try:
+            tree = ast.parse(body)
+        except SyntaxError:
+            return "\n".join(lines) + "\n" + body
+        insert_at = 0
+        for node in tree.body:
+            if (isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
+                    and isinstance(node.value.value, str)) or \
+                    (isinstance(node, ast.ImportFrom) and node.module == "__future__"):
+                insert_at = node.end_lineno
+            else:
+                break
+        src = body.splitlines()
+        return "\n".join(src[:insert_at] + lines + src[insert_at:]) + "\n"
+
     def unit_job(self, u, rnd: int):
         rel = f"_cand/test_{u.uid}_r{rnd}.py"
         body = heredoc_body(self.llm.ask(self.gen_prompt[0], self._gen_user(u, rnd, rel), f"gen:{u.uid}:r{rnd}"))
         if not body:
             return
+        body = self._with_imports(u, body)
         problem = static_problem(body)
         if problem:
             body = self._repair(rel, body, problem)
             if not body or static_problem(body):
                 return
+            body = self._with_imports(u, body)
         path = self.ws / rel
         path.write_text(body)
         tests, coll, out = self.runner.results([rel], repeats=2)
-        if coll:
-            fixed = self._repair(rel, body, "\n".join(coll)[-2500:])
+        broken = [t for t in tests if t.outcome == "failed" and triage_auto(t, rel, self.pkg) == "drop"]
+        if coll or (tests and len(broken) >= max(2, len(tests) // 2)):
+            problem = "\n".join(coll)[-2500:] if coll else (
+                "Most tests crash inside the test code itself:\n" +
+                "\n".join(f"{t.func}: {(t.crash or ['', '', t.text[-300:]])[2][:300]}" for t in broken[:6]))
+            fixed = self._repair(rel, body, problem)
             if not fixed or static_problem(fixed):
                 return
-            body = fixed
+            body = self._with_imports(u, fixed)
             path.write_text(body)
             tests, coll, out = self.runner.results([rel], repeats=2)
             if coll:
                 return
         failing = [t for t in tests if t.outcome == "failed"]
-        cands = [t for t in failing if triage_auto(t, rel, self.pkg) == "judge"]
+        cands = [t for t in failing if triage_auto(t, rel, self.pkg) == "judge" and not reads_private(body, t.func)]
         passed = [t.func for t in tests if t.outcome == "passed"]
+        self._add_guards(rel, tests)
         self.llm.note("ran", file=rel, tests=len(tests), passed=len(passed), failing=len(failing),
                       candidates=[t.name for t in cands])
+        keep, located = self.verify(rel, cands)
         verdicts = {}
-        for i in range(0, len(cands), 5):
-            verdicts.update(self.judge(u, body, cands[i:i + 5]))
-        keep = set()
+        if USE_JUDGE and keep:
+            judged = [t for t in cands if t.func in keep]
+            for i in range(0, len(judged), 5):
+                verdicts.update(self.judge(u, body, judged[i:i + 5]))
+            keep = {f for f in keep if verdicts.get(f, ("BUG",))[0] == "BUG"}
         with self.lock:
             notes = self.history.setdefault(u.uid, [])
             for t in tests:
-                v = verdicts.get(t.func)
-                if v and v[0] == "BUG":
-                    loc = (v[1] or "?").lower().strip()
-                    if self.location_count[loc] < MAX_PER_LOCATION:
-                        self.location_count[loc] += 1
-                        keep.add(t.func)
-                    notes.append(f"- {t.func}: FOUND A BUG in {v[1]}")
+                if t.func in keep:
+                    notes.append(f"- {t.func}: FOUND A BUG near {located.get(t.func, '?')}")
                 elif t.outcome == "passed":
                     notes.append(f"- {t.func}: passed (behaviour already correct)")
+                elif t in cands:
+                    notes.append(f"- {t.func}: failed, but its expectation looks wrong (no small fix explains it)")
             if keep:
                 self.sources[rel] = body
                 self.kept[rel] = keep
-        self.llm.note("kept", file=rel, kept=sorted(keep), verdicts=verdicts)
+        self.llm.note("kept", file=rel, kept=sorted(keep), located=located, verdicts=verdicts)
+
+    # ------------------------------------------------------------------ mutation-based repair check
+    def repair_check(self, tests: list[str], fixes: list[str], deadline: float = 75,
+                     baseline_only: bool = False, guards: list[str] | None = None) -> dict:
+        tag = uuid.uuid4().hex[:8]
+        req, out = self.ws / f".tagent_req_{tag}.json", self.ws / f".tagent_res_{tag}.json"
+        req.write_text(json.dumps({"package": self.pkg, "tests": tests, "fixes": fixes, "guards": guards or [],
+                                   "deadline": 0 if baseline_only else deadline, "baseline_only": baseline_only}))
+        cmd = (f"PYTHONPATH={shlex.quote(str(self.student))} timeout 115 python -m tagent.repair "
+               f"{req.name} {out.name} > /dev/null 2>&1")
+        self.runner.env.execute({"command": cmd}, timeout=120)
+        res = {}
+        if out.exists():
+            try:
+                res = json.loads(out.read_text())
+            except json.JSONDecodeError:
+                res = {}
+        req.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
+        return res
+
+    def verify(self, rel: str, cands: list[TestResult], cap: bool = True) -> tuple[set[str], dict]:
+        """Keep failing tests that a single small repair (on top of the repairs accepted so far) makes
+        pass without breaking the existing suite. Returns (kept function names, name -> site)."""
+        if not cands:
+            return set(), {}
+        ids = [f"{rel}::{t.nodeid.split('::', 1)[1]}" if "::" in t.nodeid else t.nodeid for t in cands]
+        by_id = dict(zip(ids, cands))
+        with self.lock:
+            fixes = list(self.fixes)
+            guards = list(self.guards)
+        res = self.repair_check(ids, fixes, guards=guards)
+        self.llm.note("repair", file=rel, notes=res.get("notes"), explained=res.get("explained"),
+                      baseline_passing=[t for t, ok in (res.get("baseline") or {}).items() if ok])
+        keep, located = set(), {}
+        with self.lock:
+            for tid, t in by_id.items():
+                if (res.get("baseline") or {}).get(tid):
+                    sites = ["(earlier repair)"]
+                else:
+                    sites = (res.get("explained") or {}).get(tid) or []
+                if not sites:
+                    continue
+                site = sites[0]
+                loc = ":".join(site.split(":", 3)[:3])
+                if cap and self.location_count[loc] >= MAX_PER_LOCATION:
+                    continue
+                self.location_count[loc] += 1
+                keep.add(t.func)
+                info = (res.get("sites") or {}).get(site, {})
+                located[t.func] = f"{info.get('file', '?')} line {info.get('line', '?')}" if info else site
+                if site != "(earlier repair)" and len(sites) == 1 and not self._overlaps(site):
+                    self.fixes.append(site)
+        return keep, located
+
+    def _add_guards(self, rel: str, tests: list[TestResult]):
+        with self.lock:
+            for t in tests:
+                if t.outcome == "passed" and not t.flaky and "::" in t.nodeid:
+                    self.guards.append(f"{rel}::{t.nodeid.split('::', 1)[1]}")
+
+    def _overlaps(self, site: str) -> bool:
+        f, a, b = site.split(":", 3)[:3]
+        a, b = int(a), int(b)
+        for s in self.fixes:
+            g, c, d = s.split(":", 3)[:3]
+            if g == f and int(c) < b and a < int(d):
+                return True
+        return False
 
     # ------------------------------------------------------------------ judging
     def _code_context(self, u, cands: list[TestResult]) -> str:

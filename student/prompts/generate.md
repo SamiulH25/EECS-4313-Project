@@ -55,7 +55,12 @@ Techniques to use:
    some code paths only run on large inputs. Include a few tests with sizes well beyond those
    constants (thousands of elements, built with range()), or set the documented size/load
    parameter small, and compare against the reference.
-4. Metamorphic checks where natural (e.g. inserting then removing restores the state; order of
+4. Cross-method consistency at boundaries (metamorphic): when the docs do not say whether a boundary
+   is inclusive (e.g. does an item expire exactly at its expiry time? is index == len valid?), do NOT
+   guess. Instead put the object exactly at the boundary and assert that all ways of observing it
+   agree: `k in c` vs `c.get(k)` vs `c[k]` raising KeyError vs `del c[k]` vs `k in list(c)` vs
+   `len(c)`, or `x in s` vs `s.count(x) > 0` vs `s.index(x)`, `bisect_left` vs `bisect_right`, etc.
+5. Metamorphic checks where natural (e.g. inserting then removing restores the state; order of
    insertion does not change a sorted result).
 
 Test hygiene:

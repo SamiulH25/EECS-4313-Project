@@ -282,10 +282,14 @@ class Pipeline:
                      existing=inventory.existing_tests_for(self.ws, u) or "# (none)",
                      previous=prev, n_tests="10 to 14", path=rel)
 
-    def _repair(self, rel: str, body: str, problem: str) -> str | None:
-        user = (f"This pytest file has a problem:\n```\n{problem[-2500:]}\n```\n\nThe file:\n```python\n{body}\n```\n"
-                "Rewrite the complete file so that it imports and collects cleanly. Fix only the problem; "
-                "keep the tests and their expected values. Never import os, sys, inspect, pathlib, io, "
+    def _repair(self, rel: str, body: str, problem: str, u=None) -> str | None:
+        ref = ""
+        if u is not None:
+            ref = ("Reference: how the API is documented (use exactly these call forms; never invent arguments):\n"
+                   f"{inventory.docs_for(u, self.sections, 2500) or '(none)'}\n\nSignatures:\n{u.outline[:2500]}\n\n")
+        user = (f"{ref}This pytest file has a problem:\n```\n{problem[-2500:]}\n```\n\nThe file:\n```python\n{body}\n```\n"
+                "Rewrite the complete file so that it imports, collects and runs cleanly: fix the way the "
+                "crashing tests call the API, keep what each test checks and its expected values. Never import os, sys, inspect, pathlib, io, "
                 "subprocess or importlib and never open files.\n"
                 f"Reply with exactly one bash tool call:\ncat > {rel} <<'EOF'\n<the complete file>\nEOF")
         return heredoc_body(self.llm.ask(self.gen_prompt[0], user, f"repair:{rel}"))
@@ -331,18 +335,26 @@ class Pipeline:
         path.write_text(body)
         tests, coll, out = self.runner.results([rel], repeats=2, coverage=self.arcs)
         broken = [t for t in tests if t.outcome == "failed" and triage_auto(t, rel, self.pkg) == "drop"]
-        if coll or (tests and len(broken) >= max(2, len(tests) // 2)):
+        if coll or len(broken) >= 2:
             problem = "\n".join(coll)[-2500:] if coll else (
-                "Most tests crash inside the test code itself:\n" +
+                "These tests crash inside the test code itself (wrong use of the API):\n" +
                 "\n".join(f"{t.func}: {(t.crash or ['', '', t.text[-300:]])[2][:300]}" for t in broken[:6]))
-            fixed = self._repair(rel, body, problem)
+            fixed = self._repair(rel, body, problem, u)
             if not fixed or static_problem(fixed):
-                return
-            body = self._with_imports(u, fixed)
-            path.write_text(body)
-            tests, coll, out = self.runner.results([rel], repeats=2, coverage=self.arcs)
-            if coll:
-                return
+                if coll:
+                    return
+            else:
+                old = (body, tests)
+                body = self._with_imports(u, fixed)
+                path.write_text(body)
+                tests, coll, out = self.runner.results([rel], repeats=2, coverage=self.arcs)
+                if coll:
+                    if old[1]:
+                        body, tests = old            # the rewrite broke the file: keep the original
+                        path.write_text(body)
+                        coll = []
+                    else:
+                        return
         failing = [t for t in tests if t.outcome == "failed"]
         cands = [t for t in failing if triage_auto(t, rel, self.pkg) == "judge" and not reads_private(body, t.func)]
         passed = [t.func for t in tests if t.outcome == "passed"]
@@ -454,6 +466,11 @@ class Pipeline:
                     continue
                 site = sites[0]
                 loc = ":".join(site.split(":", 3)[:3])
+                if site == "(earlier repair)":
+                    # Explained by a repair accepted earlier: count it against the place it fails at.
+                    pkg_frames = [f for f in (t.frames or []) if f"{self.pkg}/" in str(f[0])]
+                    f = pkg_frames[-1] if pkg_frames else None
+                    loc = f"earlier:{str(f[0])[str(f[0]).find(self.pkg):]}:{f[1]}" if f else f"earlier:{rel}:{t.func}"
                 if cap and self.location_count[loc] >= MAX_PER_LOCATION:
                     continue
                 self.location_count[loc] += 1

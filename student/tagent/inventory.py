@@ -413,8 +413,8 @@ def docs_for(unit: Unit, sections: list[tuple[str, str]], budget_chars: int = 45
             score += n * (3 if k == unit.cls else 1)
         named = {m.split(".")[-1] for m in _DIRECTIVE.findall(sec)}
         if named & set(keys):
-            score += 12
-        if re.search(rf"^\s*\.\.\s+(?:py:)?(?:auto)?module::\s*{re.escape(unit.module)}\s*$", sec, re.M):
+            score += 40                  # the API reference entry for this very unit
+        if "." in unit.module and re.search(rf"^\s*\.\.\s+(?:py:)?(?:auto)?module::\s*{re.escape(unit.module)}\s*$", sec, re.M):
             score += 15                  # the module's introduction explains its shared conventions
         if score:
             scored.append((score, i, name, sec))
@@ -423,9 +423,13 @@ def docs_for(unit: Unit, sections: list[tuple[str, str]], budget_chars: int = 45
     used = 0
     for score, i, name, sec in scored:
         group = [i]
-        if {m.split(".")[-1] for m in _DIRECTIVE.findall(sec)} & set(keys) and i + 1 < len(sections) \
-                and sections[i + 1][0] == name and not _DIRECTIVE.match(sections[i + 1][1]):
-            group.append(i + 1)          # the paragraphs that follow an API directive explain it
+        if {m.split(".")[-1] for m in _DIRECTIVE.findall(sec)} & set(keys):
+            for j in range(i + 1, i + 5):  # the indented paragraphs after an API directive explain it
+                if j < len(sections) and sections[j][0] == name and not _DIRECTIVE.match(sections[j][1]) \
+                        and sections[j][1][:1] in (" ", "\t"):
+                    group.append(j)
+                else:
+                    break
         for j in group:
             if j in chosen:
                 continue

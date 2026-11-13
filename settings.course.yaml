@@ -1,0 +1,47 @@
+model:
+  model_class: openrouter
+  model_name: qwen/qwen3.5-9b
+  model_kwargs:
+    temperature: 0.6
+    top_p: 0.95
+    max_tokens: 8192
+    provider:
+      sort: throughput
+      require_parameters: true
+      quantizations:
+        - fp8
+
+limits:
+  token_limit: 400000
+  step_limit: 120
+  command_timeout_seconds: 120
+
+evaluation:
+  max_tests: 300
+  test_timeout_seconds: 10
+  suite_timeout_seconds: 300
+  false_alarm_weight: 0.5
+
+observation_template: |
+  {% if output.exception_info -%}
+  <exception>{{output.exception_info}}</exception>
+  {% endif -%}
+  <returncode>{{output.returncode}}</returncode>
+  {% if output.output | length < 8000 -%}
+  <output>
+  {{ output.output -}}
+  </output>
+  {%- else -%}
+  <warning>The output was too long. Use head, tail, grep or a more selective command.</warning>
+  <output_head>
+  {{ output.output[:4000] }}
+  </output_head>
+  <output_tail>
+  {{ output.output[-4000:] }}
+  </output_tail>
+  {%- endif -%}
+
+format_error_template: |
+  Format error: {{ error }}
+  Every response must contain at least one call to the bash tool.
+  When you are done, run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` on its own.

@@ -11,50 +11,48 @@
 ## 2. Your agent
 
 The starter agent is one long conversation in which the model explores the shell. It spent its budget
-re-reading files and on cachetools wrote no tests at all. Our agent (`student/tagent/pipeline.py`) is a
-fixed pipeline. The code decides what to look at and which tests to trust; the model only writes tests.
+re-reading files and on cachetools wrote no tests at all. Our agent (`student/tagent/pipeline.py`) splits
+the work: deterministic tools do the exploring and the checking, and the model decides where effort
+goes and states the rules that tools cannot infer.
 
-1. **Doctest mining** (no model calls). Every `>>>` example in the docs and docstrings becomes a
-   one-check pytest test, with the earlier examples replayed as setup.
-2. **Inventory.** The package is split into units of at most 170 lines (a class, or a group of
-   functions). Each unit gets:
-   - an outline, including inherited bases and sibling variants;
-   - risk points (comparisons, constants, `+=`, boolean operators, slices), labelled with the
-     enclosing function (e.g. `cached.decorator.getinfo`);
-   - "suspicious" lines that disagree with similar code elsewhere;
-   - documentation excerpts chosen by matching API directives and member names.
-
-   Units are ranked by risk.
-3. **Generation.** Each unit gets a fresh, short conversation. It asks for 10–14 tests that take
-   expected values from documentation, contracts or inline reference models, using boundary values,
-   Hypothesis differential tests, equivalent call forms and two-observer consistency checks. Up to 4
-   rounds run in 4 threads. Later rounds receive:
-   - the earlier results (which tests passed, failed or crashed, with crash messages);
-   - the coverage gaps: branches no test has exercised yet.
-4. **Clean-up without the model.**
-   - Files with syntax errors or forbidden names are salvaged test by test.
-   - Missing imports are added.
-   - Crashing tests get one repair call that includes the documented call forms.
-5. **Repair check (the main filter).** Each failing test is run in-process while single small
-   mutations are tried on the lines it executed. A test is kept only if one mutation makes it pass
-   while three things stay true:
-   - the project's existing suite still passes;
-   - all passing tests ("guards") still pass;
-   - the repair does not contradict sibling code or documented numbers.
-
-   Accepted repairs are applied in later checks, so the code converges towards the correct version.
-6. **Assembly.** Kept tests are rerun twice and capped at 2 per repaired location and 300 overall.
+1. **Doctest mining** (tool). Every `>>>` example in the docs becomes a one-check test.
+2. **Contract fuzzer** (tool, `tagent/contracts.py`). It finds the public classes and functions, works out
+   how to construct them from parameter names, and recognises what each object behaves like (a dict,
+   a sorted list, a set, an `lru_cache`-style memoiser, a hash function). It then runs thousands of random
+   operation sequences against the matching standard-library reference, plus observer-consistency
+   contracts (`k in m` agrees with `m[k]`, `len` agrees with iteration). Failures are shrunk with delta
+   debugging and kept only if they fail 3 times out of 3. Later passes run on a copy of the package with
+   the repairs accepted so far applied, so one bug does not hide the next. A final pass writes long
+   regression sequences that pass on that repaired copy.
+3. **Model in the loop.** The package is split into units (a class or a group of functions, ≤170 lines)
+   with an outline, risk points and documentation excerpts. Each of up to 4 rounds:
+   - **Plan** (one model call): the model reads a one-line tool report per unit (risk points, whether
+     the fuzzer drove it, earlier results) and picks the units and a mode for each: `props`, `tests`
+     or `skip`, with a one-sentence focus.
+   - **Generate** (one fresh, short call per unit, 4 threads). In `props` mode the model writes documented
+     rules as `prop_<rule>(r)` functions of a seeded random generator; `tagent/props.py` runs each on
+     200 seeds and failing seeds become ordinary tests. In `tests` mode it writes example tests.
+   - **Feedback**: which properties held, failed on some inputs, or crashed through API misuse, plus
+     uncovered branches, goes into the next round's plan and prompts.
+4. **Clean-up without the model.** Broken files are salvaged test by test, imports are added,
+   `@settings` without `@given` is removed, and crashing tests get one repair call with the documented
+   call forms.
+5. **Repair check (the main filter).** A failing test is kept only if a single small mutation of a line it
+   executed makes it pass, while the project's suite, all passing tests and the code's own conventions
+   (sibling comparisons, documented numbers) stay intact. Accepted repairs carry into later checks.
+6. **Assembly.** Kept tests are rerun twice; at most 2 per repaired location (per class for fuzzer
+   tests) and 300 overall. Jobs reserve their expected tokens so parallel calls cannot overrun the budget.
 
 ## 3. Testing techniques
 
 | Technique | Lecture topic | Where in the code | What it does |
 |---|---|---|---|
-| Doctest mining | Specification-based testing / documentation as oracle | `tagent/doctests.py` `build_file` | Turns every documented example into an executable one-assertion test. |
-| Mutation analysis as a test oracle filter | Mutation testing | `tagent/repair.py` `mutation_sites`, `main`; `pipeline.verify` | A failing test is believed only if a single mutation (comparison, arithmetic, boolean, constant ±1, `not`) of a covered line makes it pass without breaking the existing suite or any passing test. |
-| Deviant-behaviour (sibling) analysis | Static analysis / bug patterns | `repair.py` `deviates_after`, `boundary_unsupported`, `constant_deviates_after`; `inventory.suspicious_lines` | Code is internally consistent. A repair that makes a comparison or constant disagree with its siblings is rejected, and lines that already deviate are flagged as risk points. |
-| Boundary value analysis / risk-based selection | Black-box testing, BVA | `inventory.risk_points`, `inventory.build_units` (ranking) | Lists each comparison and constant with the boundary to test, and spends the budget on the riskiest units first. |
-| Coverage-guided generation | White-box testing, coverage | `tagent/cov_plugin.py`, `pipeline.uncovered` | Records branch arcs of every generated test. Later rounds are told which branches were never true, never false or never reached. |
-| Differential / metamorphic testing | Test oracles | `prompts/generate.md` (Hypothesis model-based tests, variant hints from `build_units`) | Compares the unit against a tiny reference model, sibling classes, and equivalent call forms. |
+| Model-based / differential random testing | Test oracles, random testing | `tagent/contracts.py` `classify`, `ops_*`, `fuzz`, `ddmin` | Random operation sequences checked against `dict`/`list`/`set`/`bisect`/`functools.lru_cache`, shrunk by delta debugging. |
+| Property-based testing | Specification-based testing | `tagent/props.py`, `pipeline.run_props`, `prompts/generate.md` | The model states documented rules once; the tool checks them on 200 random inputs. |
+| Mutation analysis as a test oracle filter | Mutation testing | `tagent/repair.py`; `pipeline.verify` | A failing test is believed only if one mutation of a covered line explains it without breaking the suite or any passing test. |
+| Deviant-behaviour (sibling) analysis | Static analysis / bug patterns | `repair.py` `deviates_after`, `boundary_unsupported`; `inventory.suspicious_lines` | Repairs that make code disagree with its siblings are rejected; deviating lines are flagged as risk points. |
+| Doctest mining | Documentation as oracle | `tagent/doctests.py` | Documented examples become one-assertion tests. |
+| Risk- and coverage-guided selection | BVA, white-box coverage | `inventory.risk_points`, `cov_plugin.py`, `pipeline.plan` | Ranks units by risk; the planner and later rounds target unexercised branches. |
 
 ## 4. Evidence that a technique finds new bugs
 
@@ -84,6 +82,11 @@ All on both dev projects (40 bugs), iteration runs pinned to one provider for sp
 | Fix repair-site offsets drifting after accepted fixes | 24/40 | 1 | yes (bug in our tool: one bad fix disabled all later checks) |
 | Prompt: reset equals fresh object; counters via reference model | 25/40 | 4 | yes, with the private-access fix below |
 | Treat `getattr(obj, "_private")` as private-state access | 17/40 | 0 | yes (FA fix; the recall drop is run-to-run variance: sortedcontainers kept as many tests) |
+| Contract fuzzer before the model (tools alone, no model calls) | 32/40 | 0 | yes |
+| Fuzzer + old model loop | 32/40 | 4 | yes |
+| Planner + property runner (model in the loop) | 30/40 | 5 | changed: `@settings` without `@given` slipped through |
+| Strip pointless `@settings`, per-class cap for fuzzer tests, token reservation | 31/40 | 2 | yes |
+| Fuzzer: set `count`, `index(start, stop)`, colliding keys, long regression sequences | 33/40 | 1 | yes (final) |
 
 ## 7. Questions
 

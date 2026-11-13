@@ -40,6 +40,9 @@ USE_BOUNDARY_VOTE = False   # the 9B model voted the wrong way; sibling evidence
 # Technique switches (turned off only in ablation copies made by scripts/make_variant.sh)
 USE_DOCTESTS = True         # mine documentation examples into one-check tests
 USE_REPAIR_FILTER = True    # keep a failing test only if a single small code repair explains it
+USE_CONTRACTS = True        # model-free contract fuzzing (reference models, observer consistency, ddmin)
+CONTRACT_SEEDS = (1, 2, 3, 4)  # one fuzzing pass (about 90 s) per seed, each on top of the repairs found so far
+CONTRACT_MAX_VERIFY = 15    # failing contract tests per pass sent to the repair check (spread over failure kinds)
 MAX_TESTS = 300
 
 
@@ -157,6 +160,8 @@ class Pipeline:
         self.location_count: Counter = Counter()
         self.history: dict[str, list[str]] = {}   # unit uid -> notes for later rounds
         self.fixes: list[str] = []                # accepted repair sites (approximates the correct code)
+        self.shadow_fixes: list[str] = []         # plus first explanations of ambiguous failures (fuzzing only)
+        self.last_explained: dict = {}
         self.guards: list[str] = []               # passing tests that a trusted repair must keep passing
         self.arcs: dict[str, set] = {}            # package file -> executed (from_line, to_line) arcs
         self.max_tests = getattr(task, "max_tests", MAX_TESTS) or MAX_TESTS
@@ -188,7 +193,61 @@ class Pipeline:
                 self.sources[rel] = src
                 self.kept[rel] = keep
 
-    # ------------------------------------------------------------------ phase 2: model-written tests
+    # ------------------------------------------------------------------ phase 2: contract fuzzing (no model)
+    def contract_phase(self):
+        for seed in CONTRACT_SEEDS:
+            tag = uuid.uuid4().hex[:8]
+            req, out = self.ws / f".tagent_creq_{tag}.json", self.ws / f".tagent_cres_{tag}.json"
+            with self.lock:
+                fixes = list(self.fixes) + [f for f in self.shadow_fixes if f not in self.fixes]
+            req.write_text(json.dumps({"package": self.pkg, "deadline": 85, "seed": seed, "per_sig": 2,
+                                       "max_tests": 60, "fixes": fixes}))
+            cmd = (f"PYTHONPATH={shlex.quote(str(self.student))} timeout 112 python -m tagent.contracts "
+                   f"{req.name} {out.name} > /dev/null 2>&1")
+            self.runner.env.execute({"command": cmd}, timeout=120)
+            res = {}
+            if out.exists():
+                try:
+                    res = json.loads(out.read_text())
+                except json.JSONDecodeError:
+                    res = {}
+            req.unlink(missing_ok=True)
+            out.unlink(missing_ok=True)
+            src = res.get("source") or ""
+            self.llm.note("contracts", seed=seed, stats=res.get("stats"), labels=res.get("labels"))
+            if not src or static_problem(src):
+                if src:
+                    self.llm.note("contracts", seed=seed, error=static_problem(src))
+                continue
+            rel = f"_cand/test_contracts_{seed}.py"
+            (self.ws / rel).write_text(src)
+            tests, coll, _ = self.runner.results([rel], repeats=2)
+            failing = [t for t in tests if t.outcome == "failed"]
+            cands = [t for t in failing if triage_auto(t, rel, self.pkg) == "judge"]
+            # round-robin over (target, failure kind) so one bug does not use up the repair-check time
+            labels = res.get("labels") or []
+            groups: dict = {}
+            for t in cands:
+                m = re.search(r"_(\d+)$", t.func)
+                g = tuple(labels[int(m.group(1))]) if m and int(m.group(1)) < len(labels) else (t.func,)
+                groups.setdefault(g, []).append(t)
+            picked = []
+            while len(picked) < CONTRACT_MAX_VERIFY and any(groups.values()):
+                for g in list(groups):
+                    if groups[g] and len(picked) < CONTRACT_MAX_VERIFY:
+                        picked.append(groups[g].pop(0))
+            keep, located = self.verify(rel, picked)
+            with self.lock:
+                for sites in (self.last_explained or {}).values():
+                    if sites and sites[0] not in self.shadow_fixes and not self._overlaps_any(sites[0], self.shadow_fixes + self.fixes):
+                        self.shadow_fixes.append(sites[0])
+            self.llm.note("kept", file=rel, kept=sorted(keep), located=located, collection=coll[:1])
+            if keep:
+                with self.lock:
+                    self.sources[rel] = src
+                    self.kept[rel] = keep
+
+    # ------------------------------------------------------------------ phase 3: model-written tests
     def llm_phase(self):
         self.units = inventory.build_units(self.ws, self.pkg)
         self.sections = inventory.doc_sections(self.ws)
@@ -462,6 +521,7 @@ class Pipeline:
                       errors=res.get("errors"), guard_errors=res.get("guard_errors"),
                       guard_rejected=res.get("guard_rejected"), suite_ok=res.get("suite_ok"),
                       sibling_rejected=res.get("sibling_rejected"))
+        self.last_explained = res.get("explained") or {}
         keep, located = set(), {}
         # Boundary flips (< vs <=) are where the model most often guesses wrongly at an undocumented
         # edge: ask several independent focused questions before trusting one.
@@ -554,6 +614,22 @@ class Pipeline:
             for t in tests:
                 if t.outcome == "passed" and not t.flaky and "::" in t.nodeid:
                     self.guards.append(f"{rel}::{t.nodeid.split('::', 1)[1]}")
+
+    @staticmethod
+    def _overlaps_any(site: str, others: list[str]) -> bool:
+        try:
+            rel, a, b, _ = site.split(":", 3)
+            a, b = int(a), int(b)
+        except ValueError:
+            return True
+        for o in others:
+            try:
+                r2, c, d, _ = o.split(":", 3)
+            except ValueError:
+                continue
+            if r2 == rel and int(c) < b and a < int(d):
+                return True
+        return False
 
     def _overlaps(self, site: str) -> bool:
         f, a, b = site.split(":", 3)[:3]
@@ -666,6 +742,11 @@ class Pipeline:
                     self.doctest_phase()
             except Exception as error:  # noqa: BLE001
                 self.llm.note("doctest-error", error=f"{error}\n{traceback.format_exc()[-1500:]}")
+            try:
+                if USE_CONTRACTS:
+                    self.contract_phase()
+            except Exception as error:  # noqa: BLE001
+                self.llm.note("contract-error", error=f"{error}\n{traceback.format_exc()[-1500:]}")
             try:
                 self.llm_phase()
             except LimitsExceeded:

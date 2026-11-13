@@ -592,7 +592,8 @@ def main():
         if profiles is not None:
             profiles.load_profile(name)
 
-    tmp = Path(tempfile.mkdtemp(prefix="tagent-repair-"))
+    # scratch copy inside the workspace (the agent must not use anything outside it)
+    tmp = Path(tempfile.mkdtemp(prefix=".tagent-repair-", dir=ws))
     try:
         shutil.copytree(ws / pkg, tmp / pkg, ignore=shutil.ignore_patterns("__pycache__"))
         if (ws / suite).is_dir():

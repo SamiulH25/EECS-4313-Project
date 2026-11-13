@@ -35,7 +35,7 @@ aim at least one test at each of them (the documented or majority behaviour is t
 ```
 {{previous}}
 ## Your job
-Write {{n_tests}} focused pytest tests for this unit that would expose bugs at the risk points.
+Expose bugs at the risk points. {{mode}}
 
 How to choose expected values (most important rule):
 - Take them from the docstrings and documentation, from the general contract of the operation
@@ -95,6 +95,8 @@ arguments) and use exactly the documented call forms. Never invent keyword argum
 
 Test hygiene:
 - One behaviour per test, at most 4 asserts, descriptive names starting with `test_`.
+- Properties (`def prop_<rule>(r):`) may assert after every step of their random sequence; they use only
+  `r` for randomness and must build every object they use inside the function.
 - Tests are independent and deterministic; no sleep, no real clock: use a fake timer object where
   a timer is accepted.
 - Do not assert on private attributes, exact exception messages, reprs or performance.

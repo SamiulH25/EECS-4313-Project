@@ -30,10 +30,11 @@ from minisweagent.exceptions import LimitsExceeded
 
 from . import doctests, inventory
 from .llm import LLM, heredoc_body
-from .runner import salvage, CONFTEST, Runner, TestResult, static_problem, triage_auto
+from .runner import salvage, CONFTEST, Runner, TestResult, static_problem, strip_pointless_settings, triage_auto
 
 WORKERS = 4
 JOB_RESERVE = 30_000        # do not start a unit job with fewer tokens left than this
+JOB_EST = 18_000            # typical tokens of one unit job (generation + repairs); reserved per running job
 MAX_PER_LOCATION = 2        # kept tests per repaired location
 USE_JUDGE = False           # the LLM judge was too permissive; the repair check replaces it
 USE_BOUNDARY_VOTE = False   # the 9B model voted the wrong way; sibling evidence is used instead
@@ -42,7 +43,12 @@ USE_DOCTESTS = True         # mine documentation examples into one-check tests
 USE_REPAIR_FILTER = True    # keep a failing test only if a single small code repair explains it
 USE_CONTRACTS = True        # model-free contract fuzzing (reference models, observer consistency, ddmin)
 CONTRACT_SEEDS = (1, 2, 3, 4)  # one fuzzing pass (about 90 s) per seed, each on top of the repairs found so far
-CONTRACT_MAX_VERIFY = 15    # failing contract tests per pass sent to the repair check (spread over failure kinds)
+CONTRACT_MAX_VERIFY = 15
+CONTRACT_LONG = 2          # long regression sequences per driven object, written after the shrunk passes    # failing contract tests per pass sent to the repair check (spread over failure kinds)
+USE_PLANNER = True          # the model plans each round from the tools' report
+USE_PROPS = True            # the model may state documented rules as properties; a tool explores inputs
+PROP_SEEDS = 200            # random inputs per property
+ROUNDS = 4
 MAX_TESTS = 300
 
 
@@ -120,6 +126,17 @@ def prune(src: str, keep: set[str]) -> str:
     return ast.unparse(tree) + "\n"
 
 
+PROPS_MODE = """Write PROPERTIES first, then a few plain tests.
+A property is a top-level function `def prop_<rule>(r):` (r is a `random.Random`). It states ONE documented
+rule for ANY input: use r to choose sizes, keys, values and a short random sequence of operations, build a
+fresh object inside the function, and assert the rule (compare against a tiny reference model in plain
+Python, or against another documented way of observing the same thing). A tool runs every property on 200
+random inputs and turns the inputs that break the rule into tests, so state rules, not examples.
+Write 3 to 6 properties for the documented behaviour that the risk points control (eviction order,
+expiry times, counters, bounds, ordering), then {{n_tests}} plain tests for edge cases."""
+
+TESTS_MODE = """Write {{n_tests}} focused pytest tests."""
+
 _FLIPS = {("<", "<="), ("<=", "<"), (">", ">="), (">=", ">")}
 
 
@@ -162,6 +179,9 @@ class Pipeline:
         self.fixes: list[str] = []                # accepted repair sites (approximates the correct code)
         self.shadow_fixes: list[str] = []         # plus first explanations of ambiguous failures (fuzzing only)
         self.last_explained: dict = {}
+        self.contract_info: dict = {"targets": [], "located": []}   # what the fuzzer covered and found
+        self.unit_stats: dict[str, dict] = {}     # uid -> rounds, kept, last summary (planner input)
+        self.plan_prompt = _load_prompt(self.student / "prompts" / "plan.md")
         self.guards: list[str] = []               # passing tests that a trusted repair must keep passing
         self.arcs: dict[str, set] = {}            # package file -> executed (from_line, to_line) arcs
         self.max_tests = getattr(task, "max_tests", MAX_TESTS) or MAX_TESTS
@@ -195,13 +215,19 @@ class Pipeline:
 
     # ------------------------------------------------------------------ phase 2: contract fuzzing (no model)
     def contract_phase(self):
-        for seed in CONTRACT_SEEDS:
+        passes = list(CONTRACT_SEEDS) + ([0] if CONTRACT_LONG else [])
+        for seed in passes:
             tag = uuid.uuid4().hex[:8]
             req, out = self.ws / f".tagent_creq_{tag}.json", self.ws / f".tagent_cres_{tag}.json"
+            long = CONTRACT_LONG if seed == 0 else 0
             with self.lock:
-                fixes = list(self.fixes) + [f for f in self.shadow_fixes if f not in self.fixes]
-            req.write_text(json.dumps({"package": self.pkg, "deadline": 85, "seed": seed, "per_sig": 2,
-                                       "max_tests": 60, "fixes": fixes}))
+                # long sequences must pass on the code with only the confidently accepted repairs
+                fixes = list(self.fixes) if long else \
+                    list(self.fixes) + [f for f in self.shadow_fixes if f not in self.fixes]
+            if long and not fixes:
+                continue
+            req.write_text(json.dumps({"package": self.pkg, "deadline": 60, "seed": 99 if long else seed,
+                                       "per_sig": 2, "max_tests": 60, "fixes": fixes, "long": long}))
             cmd = (f"PYTHONPATH={shlex.quote(str(self.student))} timeout 112 python -m tagent.contracts "
                    f"{req.name} {out.name} > /dev/null 2>&1")
             self.runner.env.execute({"command": cmd}, timeout=120)
@@ -215,11 +241,15 @@ class Pipeline:
             out.unlink(missing_ok=True)
             src = res.get("source") or ""
             self.llm.note("contracts", seed=seed, stats=res.get("stats"), labels=res.get("labels"))
+            with self.lock:
+                for t in (res.get("stats") or {}).get("targets") or []:
+                    if t not in self.contract_info["targets"]:
+                        self.contract_info["targets"].append(t)
             if not src or static_problem(src):
                 if src:
                     self.llm.note("contracts", seed=seed, error=static_problem(src))
                 continue
-            rel = f"_cand/test_contracts_{seed}.py"
+            rel = f"_cand/test_contracts_{seed or 'long'}.py"
             (self.ws / rel).write_text(src)
             tests, coll, _ = self.runner.results([rel], repeats=2)
             failing = [t for t in tests if t.outcome == "failed"]
@@ -236,7 +266,9 @@ class Pipeline:
                 for g in list(groups):
                     if groups[g] and len(picked) < CONTRACT_MAX_VERIFY:
                         picked.append(groups[g].pop(0))
-            keep, located = self.verify(rel, picked)
+            keep, located = self.verify(rel, picked, group=lambda f: re.sub(r"^test_contract_|_\d+$", "", f))
+            with self.lock:
+                self.contract_info["located"] += list(located.values())
             with self.lock:
                 for sites in (self.last_explained or {}).values():
                     if sites and sites[0] not in self.shadow_fixes and not self._overlaps_any(sites[0], self.shadow_fixes + self.fixes):
@@ -253,47 +285,91 @@ class Pipeline:
         self.sections = inventory.doc_sections(self.ws)
         order = sorted([u for u in self.units if u.weight >= 1], key=lambda u: -u.weight)
         self.llm.note("units", units=[(u.uid, round(u.weight, 1), len(u.risks)) for u in order])
-        jobs: queue.Queue = queue.Queue()
-        for u in order:
-            jobs.put((u, 1))
-        state = {"round": 1}
         stop = threading.Event()
+        self.focus: dict[str, tuple[str, str]] = {}
+        self.inflight = 0
+        for rnd in range(1, ROUNDS + 1):
+            if stop.is_set() or self.llm.tokens_left < JOB_RESERVE:
+                break
+            default = order if rnd <= 2 else order[: max(1, len(order) // 2)]
+            plan = self.plan(rnd, order, default) if USE_PLANNER else [(u, "tests", "") for u in default]
+            if not plan:
+                break
+            jobs: queue.Queue = queue.Queue()
+            for u, action, focus in plan:
+                self.focus[u.uid] = (action, focus)
+                jobs.put(u)
 
-        def refill():
-            with self.lock:
-                state["round"] += 1
-                rnd = state["round"]
-                if rnd > 4:
-                    return False
-                # revisit the riskiest half first, then the rest
-                for u in order[: max(1, len(order) // 2)] if rnd > 2 else order:
-                    jobs.put((u, rnd))
-                return True
-
-        def worker():
-            while not stop.is_set():
-                if self.llm.tokens_left < JOB_RESERVE:
-                    stop.set()
-                    return
-                try:
-                    u, rnd = jobs.get_nowait()
-                except queue.Empty:
-                    if not refill():
+            def worker(rnd=rnd, jobs=jobs):
+                while not stop.is_set():
+                    with self.lock:
+                        # keep the jobs already running from pushing the total past the budget
+                        if self.llm.tokens_left - self.inflight * JOB_EST < max(JOB_RESERVE, JOB_EST):
+                            stop.set()
+                            return
+                        try:
+                            u = jobs.get_nowait()
+                        except queue.Empty:
+                            return
+                        self.inflight += 1
+                    try:
+                        self.unit_job(u, rnd)
+                    except LimitsExceeded:
+                        stop.set()
                         return
-                    continue
-                try:
-                    self.unit_job(u, rnd)
-                except LimitsExceeded:
-                    stop.set()
-                    return
-                except Exception as error:  # noqa: BLE001
-                    self.llm.note("job-error", unit=u.uid, error=f"{error}\n{traceback.format_exc()[-1500:]}")
+                    except Exception as error:  # noqa: BLE001
+                        self.llm.note("job-error", unit=u.uid, error=f"{error}\n{traceback.format_exc()[-1500:]}")
+                    finally:
+                        with self.lock:
+                            self.inflight -= 1
 
-        threads = [threading.Thread(target=worker, daemon=True) for _ in range(WORKERS)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+            threads = [threading.Thread(target=worker, daemon=True) for _ in range(WORKERS)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+    # ------------------------------------------------------------------ planner
+    def _unit_report(self, u) -> str:
+        names = {w for w in re.findall(r"[A-Za-z_]\w*", u.title) if len(w) > 2}
+        fuzz = sorted({t.split(":")[0] for t in self.contract_info["targets"]
+                       if any(re.search(rf"\b{re.escape(n)}\b", t) for n in names)})
+        bugs = 0
+        for loc in self.contract_info["located"]:
+            m = re.match(r"(.+) line (\d+)", loc)
+            if m and m.group(1).endswith(u.path) and any(a <= int(m.group(2)) <= b for a, b in u.spans):
+                bugs += 1
+        st = self.unit_stats.get(u.uid, {})
+        gaps = len(self.uncovered(u)) if st.get("rounds") else len(u.risks)
+        return (f"- {u.uid} | {u.title[:60]} | risk points {len(u.risks)} | fuzzer: "
+                f"{', '.join(fuzz) if fuzz else 'could not drive it'}, bugs it confirmed here {bugs} | "
+                f"model rounds so far {st.get('rounds', 0)}, bugs confirmed {st.get('kept', 0)} | "
+                f"unexercised branches/risk points {gaps} | last round: {st.get('last', '-')}")
+
+    def plan(self, rnd: int, order: list, default: list) -> list:
+        """One model call: choose the units for this round and what to do with each."""
+        report = "\n".join(self._unit_report(u) for u in order)
+        user = _fill(self.plan_prompt[1], project=self.task.project, summary=self.task.summary, round=str(rnd),
+                     rounds=str(ROUNDS), report=report, tokens=str(self.llm.tokens_left))
+        text = heredoc_body(self.llm.ask(self.plan_prompt[0], user, f"plan:r{rnd}")) or ""
+        by_id = {u.uid: u for u in order}
+        plan, seen = [], set()
+        for line in text.splitlines():
+            parts = [x.strip(" `*-") for x in line.split("|")]
+            if len(parts) < 2 or parts[0] not in by_id or parts[0] in seen:
+                continue
+            action = parts[1].lower()
+            if action not in ("props", "tests", "skip"):
+                continue
+            seen.add(parts[0])
+            if action != "skip":
+                plan.append((by_id[parts[0]], action, (parts[2] if len(parts) > 2 else "")[:300]))
+        self.llm.note("plan", round=rnd, plan=[(u.uid, a, f) for u, a, f in plan], raw=text[:3000])
+        if len(plan) < min(3, len(default)):
+            # unusable or too timid a plan: fall back to risk order, keeping what the planner chose
+            chosen = {u.uid for u, _, _ in plan}
+            plan += [(u, "props" if USE_PROPS else "tests", "") for u in default if u.uid not in chosen]
+        return plan
 
     def uncovered(self, u) -> list[str]:
         """Branch outcomes in the unit that no generated test has exercised (coverage-guided rounds)."""
@@ -342,7 +418,13 @@ class Pipeline:
             prev += ("\n## Branches and risk points that NO test has exercised yet (coverage)\n"
                      "Write tests that drive these, with expected values from the documentation:\n"
                      + "\n".join(f"- {g}" for g in gaps) + "\n")
+        action, focus = getattr(self, "focus", {}).get(u.uid, ("props" if USE_PROPS else "tests", ""))
+        if focus:
+            prev += f"\n## Focus for this round (from the planner)\n{focus}\n"
+        n_tests = "6 to 10" if action == "props" and USE_PROPS else "10 to 14"
+        mode = (PROPS_MODE if action == "props" and USE_PROPS else TESTS_MODE).replace("{{n_tests}}", n_tests)
         return _fill(self.gen_prompt[1], project=self.task.project, summary=self.task.summary, title=u.title,
+                     mode=mode,
                      import_hint=u.import_hint,
                      # later rounds: the notes carry what was learnt, so the reference material is trimmed
                      docs=inventory.docs_for(u, self.sections, 4500 if rnd == 1 else 3000) or "(none found)",
@@ -350,7 +432,7 @@ class Pipeline:
                      risks="\n".join(u.risks) or "(none detected)",
                      existing=(inventory.existing_tests_for(self.ws, u) or "# (none)") if rnd == 1
                      else "# (see round 1; omitted)",
-                     previous=prev, n_tests="10 to 14", path=rel)
+                     previous=prev, n_tests=n_tests, path=rel)
 
     def _repair(self, rel: str, body: str, problem: str, u=None) -> str | None:
         ref = ""
@@ -372,7 +454,7 @@ class Pipeline:
         if f"from {self.pkg} import *" not in body:
             lines.append(f"from {self.pkg} import *  # noqa: F401,F403")
         if not lines:
-            return body
+            return strip_pointless_settings(body)
         # keep a leading module docstring / __future__ imports first
         try:
             tree = ast.parse(body)
@@ -387,7 +469,7 @@ class Pipeline:
             else:
                 break
         src = body.splitlines()
-        return "\n".join(src[:insert_at] + lines + src[insert_at:]) + "\n"
+        return strip_pointless_settings("\n".join(src[:insert_at] + lines + src[insert_at:]) + "\n")
 
     def unit_job(self, u, rnd: int):
         rel = f"_cand/test_{u.uid}_r{rnd}.py"
@@ -412,6 +494,10 @@ class Pipeline:
                 body = self._with_imports(u, fixed)
         path = self.ws / rel
         path.write_text(body)
+        prop_notes: list[str] = []
+        if USE_PROPS and re.search(r"^def prop_\w+\(\s*r\s*\)", body, re.M):
+            body, prop_notes = self.run_props(rel, body)
+            path.write_text(body)
         tests, coll, out = self.runner.results([rel], repeats=2, coverage=self.arcs)
         broken = [t for t in tests if t.outcome == "failed" and triage_auto(t, rel, self.pkg) == "drop"]
         if coll or len(broken) >= 2:
@@ -435,7 +521,10 @@ class Pipeline:
                     else:
                         return
         failing = [t for t in tests if t.outcome == "failed"]
-        cands = [t for t in failing if triage_auto(t, rel, self.pkg) == "judge" and not reads_private(body, t.func)]
+        def private(func):
+            m = re.match(r"test_(prop_\w+)_seed\d+$", func)
+            return reads_private(body, func) or bool(m and reads_private(body, m.group(1)))
+        cands = [t for t in failing if triage_auto(t, rel, self.pkg) == "judge" and not private(t.func)]
         passed = [t.func for t in tests if t.outcome == "passed"]
         self._add_guards(rel, tests)
         self.llm.note("ran", file=rel, tests=len(tests), passed=len(passed), failing=len(failing),
@@ -449,6 +538,12 @@ class Pipeline:
             keep = {f for f in keep if verdicts.get(f, ("BUG",))[0] == "BUG"}
         with self.lock:
             notes = self.history.setdefault(u.uid, [])
+            notes += prop_notes
+            st = self.unit_stats.setdefault(u.uid, {"rounds": 0, "kept": 0})
+            st["rounds"] += 1
+            st["kept"] += len(keep)
+            st["last"] = (f"{len(tests)} tests, {len(passed)} passed, {len(failing)} failed, "
+                          f"{len(keep)} confirmed as bugs")
             for t in tests:
                 if t.func in keep:
                     notes.append(f"- {t.func}: FOUND A BUG near {located.get(t.func, '?')}")
@@ -465,6 +560,57 @@ class Pipeline:
                 self.sources[rel] = body
                 self.kept[rel] = keep
         self.llm.note("kept", file=rel, kept=sorted(keep), located=located, verdicts=verdicts)
+
+    # ------------------------------------------------------------------ model-stated properties
+    def run_props(self, rel: str, body: str) -> tuple[str, list[str]]:
+        """Run every `prop_<name>(r)` on PROP_SEEDS random inputs; failing inputs become plain tests."""
+        names = re.findall(r"^def (prop_\w+)\(\s*r\s*\)", body, re.M)
+        tag = uuid.uuid4().hex[:8]
+        req, out = self.ws / f".tagent_preq_{tag}.json", self.ws / f".tagent_pres_{tag}.json"
+        req.write_text(json.dumps({"file": rel, "package": self.pkg, "props": names, "seeds": PROP_SEEDS,
+                                   "deadline": 90}))
+        cmd = (f"PYTHONPATH={shlex.quote(str(self.student))} timeout 112 python -m tagent.props "
+               f"{req.name} {out.name} > /dev/null 2>&1")
+        self.runner.env.execute({"command": cmd}, timeout=120)
+        res = {}
+        if out.exists():
+            try:
+                res = json.loads(out.read_text())
+            except json.JSONDecodeError:
+                res = {}
+        req.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
+        props = res.get("props") or {}
+        self.llm.note("props", file=rel, error=res.get("error"),
+                      props={k: {"runs": v.get("runs"), "fails": len(v.get("fails") or []), "first": v.get("first"),
+                                 "kinds": v.get("kinds")} for k, v in props.items()})
+        notes, added = [], []
+        for name, r in props.items():
+            runs, fails = r.get("runs", 0), r.get("fails") or []
+            if not runs:
+                notes.append(f"- {name}: did not run ({r.get('first') or res.get('error') or 'error'})")
+                continue
+            if not fails:
+                notes.append(f"- {name}: held for all {runs} random inputs (no bug there)")
+                continue
+            not_assert = not str(r.get("first", "")).startswith("AssertionError")
+            if not_assert and (r.get("where") in ("property", "other") or len(fails) == runs):
+                notes.append(f"- {name}: CRASHED inside the property itself on {len(fails)}/{runs} inputs "
+                             f"({r.get('first')}); fix how it uses the API")
+                continue
+            if len(fails) == runs:
+                notes.append(f"- {name}: failed for EVERY input ({r.get('first')}); either the rule is wrong "
+                             "(re-read the docs) or the code is broken everywhere")
+            else:
+                notes.append(f"- {name}: failed for {len(fails)}/{runs} random inputs ({r.get('first')})")
+            # the smallest failing seeds become deterministic tests
+            for seed in fails[:2]:
+                added.append(f"\n\ndef test_{name}_seed{seed}():\n    {name}(random.Random({seed}))\n")
+        if added:
+            if not re.search(r"^import random\b", body, re.M):
+                body = "import random\n" + body
+            body = body.rstrip() + "".join(added) + "\n"
+        return body, notes
 
     # ------------------------------------------------------------------ mutation-based repair check
     def repair_check(self, tests: list[str], fixes: list[str], deadline: float = 65,
@@ -488,7 +634,8 @@ class Pipeline:
         out.unlink(missing_ok=True)
         return res
 
-    def verify(self, rel: str, cands: list[TestResult], cap: bool = True, unit=None) -> tuple[set[str], dict]:
+    def verify(self, rel: str, cands: list[TestResult], cap: bool = True, unit=None,
+               group=None) -> tuple[set[str], dict]:
         """Keep failing tests that a single small repair (on top of the repairs accepted so far) makes
         pass without breaking the existing suite. Returns (kept function names, name -> site)."""
         if not cands:
@@ -539,6 +686,8 @@ class Pipeline:
         with self.lock:
             for tid, t in by_id.items():
                 if (res.get("baseline") or {}).get(tid):
+                    if not self.fixes:
+                        continue        # passes in-process with no repair at all: runner disagreement
                     sites = ["(earlier repair)"]
                 else:
                     sites = (res.get("explained") or {}).get(tid) or []
@@ -553,6 +702,10 @@ class Pipeline:
                     pkg_frames = [f for f in (t.frames or []) if f"{self.pkg}/" in str(f[0])]
                     f = pkg_frames[-1] if pkg_frames else None
                     loc = f"earlier:{str(f[0])[str(f[0]).find(self.pkg):]}:{f[1]}" if f else f"earlier:{rel}:{t.func}"
+                if group:
+                    # contract tests: one long operation sequence often exposes several bugs on other
+                    # paths, so allow the cap per (location, driven class) to keep the classes diverse
+                    loc = f"{loc}|{group(t.func)}"
                 if cap and self.location_count[loc] >= MAX_PER_LOCATION:
                     continue
                 self.location_count[loc] += 1

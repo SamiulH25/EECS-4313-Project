@@ -51,6 +51,9 @@ class _Clock:
 def _neg(x):
     return -x
 
+def _half(x):
+    return x // 2
+
 
 def _far(*args):
     nums = [a for a in args if isinstance(a, (int, float)) and not isinstance(a, bool)]
@@ -192,6 +195,21 @@ def _c_clear(m, probe):
 
 
 def _check_seq(s, ref, key, probe):
+    if key is _half:
+        # equal keys: the order among equal-key values is unspecified, so compare keys and contents only
+        assert [key(v) for v in s] == sorted(key(v) for v in ref), f"key order {list(s)}"
+        assert sorted(s) == sorted(ref), f"contents {list(s)} != {ref}"
+        assert len(s) == len(ref), f"len {len(s)} != {len(ref)}"
+        for x in probe:
+            assert (x in s) == (x in ref), f"{x} in s"
+            if hasattr(s, "count"):
+                assert s.count(x) == ref.count(x), f"count({x})"
+            if hasattr(s, "index"):
+                o = _outcome(lambda: s.index(x))
+                assert o[0] == ("ok" if x in ref else "raises"), f"index({x}) gives {o}"
+                if o[0] == "ok":
+                    assert s[o[1]] == x, f"index({x}) = {o[1]} but s[{o[1]}] = {s[o[1]]}"
+        return
     assert list(s) == ref, f"contents {list(s)} != {ref}"
     assert len(s) == len(ref), f"len {len(s)} != {len(ref)}"
     n = len(ref)
@@ -283,7 +301,7 @@ def _param_options(p: inspect.Parameter, big: bool) -> list[str | None]:
     if "ttl" in n or "timeout" in n or "expire" in n:
         return ["10"]
     if n == "key":
-        return [None, "_neg"] if has_default else ["_neg"]
+        return [None, "_neg", "_half"] if has_default else ["_neg", "_half"]
     if isinstance(d, bool) or n in ("typed",):
         return [None]
     if (isinstance(d, int) and not isinstance(d, bool)) or (
@@ -387,6 +405,8 @@ def _is_sorted_like(lst, vals):
         return "None"
     if lst == sorted(vals, key=lambda x: -x):
         return "_neg"
+    if lst != sorted(vals) and sorted(lst) == sorted(vals) and [x // 2 for x in lst] == sorted(x // 2 for x in vals):
+        return "_half"
     return None
 
 
@@ -413,7 +433,7 @@ def classify(path: str, cls, modules: set) -> list[Target]:
         if k not in seen:
             seen.add(k)
             out.append(t)
-    return out[:5]
+    return out[:6]
 
 
 def _try(f):
@@ -438,6 +458,8 @@ def _classify_obj(path, ctor, obj, ns, big):
         dictlike = ok is not _MISSING and _try(lambda: len(fresh) == 5 and all(fresh[k] == k * 10 for k in (5, 1, 4, 3, 0))) is True
         if big and dictlike:
             key = _is_sorted_like(_try(lambda: list(fresh)), [5, 1, 4, 3, 0])
+            if key == "_half":
+                return None
             return Target(path, "map-ref", ctor, None, None, key=key or "None", ordered=key is not None,
                           extra={"regime": "ref", "clock": uses_clock})
         if ok is _MISSING or _try(lambda: fresh[0] == 0) is not True:
@@ -463,7 +485,7 @@ def _classify_obj(path, ctor, obj, ns, big):
             return Target(path, "seq-sorted", ctor, None, None, key=key, ordered=True,
                           extra={"regime": "ref", "init": init, "indexable": indexable,
                                  "cmp": _try(lambda: fresh == lst) is True})
-        if dkey is not None:
+        if dkey is not None and dkey != "_half":
             return Target(path, "set-sorted", ctor, None, None, key=dkey, ordered=True,
                           extra={"regime": "ref", "init": init, "indexable": indexable})
         if sorted(lst) == sorted(set(vals)):
@@ -569,7 +591,9 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
     i = r.randrange(-6, 6)
     a, b = r.randrange(-5, 6), r.randrange(-5, 7)
     opts = ["add", "add", "add", "discard", "remove", "update", "pop", "popi", "delitem", "delslice", "clear",
-            "islice", "irange_none", "iadd", "add_op", "mul", "cmp"]
+            "islice", "irange_none", "iadd", "add_op", "mul", "cmp", "index_range"]
+    if K == "_half":
+        opts = ["add", "add", "add", "discard", "discard", "remove", "update", "iadd", "clear"]
     c = r.choice(opts)
     code = {
         "add": f"_same(lambda: s.add({x}), lambda: _ins(ref, {K}, {x}), 'add({x})')",
@@ -581,6 +605,9 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
         "delitem": f"_same(lambda: s.__delitem__({i}), lambda: ref.__delitem__({i}), 'del s[{i}]')",
         "delslice": f"_same(lambda: s.__delitem__(slice({a}, {b})), lambda: ref.__delitem__(slice({a}, {b})), 'del s[{a}:{b}]')",
         "clear": "_same(lambda: s.clear(), lambda: ref.clear(), 'clear()')",
+        "index_range": (f"if hasattr(s, 'index'):\n    _same(lambda: s.index({x}, {a}, {b}), "
+                        f"lambda: ref.index({x}, {a}, {b}), 'index({x}, {a}, {b})')\n"
+                        f"    _same(lambda: s.index({x}, {a}), lambda: ref.index({x}, {a}), 'index({x}, {a})')"),
         "islice": (f"if hasattr(s, 'islice'):\n    _same(lambda: list(s.islice({abs(a)}, {abs(b)})), "
                    f"lambda: ref[{abs(a)}:{abs(b)}], 'islice({abs(a)}, {abs(b)})')\n"
                    f"    _same(lambda: list(s.islice({abs(a)}, {abs(b)}, reverse=True)), "
@@ -607,7 +634,7 @@ def ops_set(t: Target, r: random.Random) -> str:
     norm = f"lambda z: sorted(z, key={K})" if ordered else "lambda z: sorted(z)"
     c = r.choice(["add", "add", "add", "discard", "remove", "or", "and", "sub", "xor", "union", "inter", "diff",
                   "symdiff", "ior", "iand", "isub", "ixor", "update", "iupd", "dupd", "supd", "cmp", "disjoint",
-                  "issub", "issup", "pop", "clear", "index"])
+                  "issub", "issup", "pop", "clear", "index", "count"])
     if c in ("or", "and", "sub", "xor"):
         op = {"or": "|", "and": "&", "sub": "-", "xor": "^"}[c]
         code = (f"_same(lambda: ({norm})(s {op} {o}), lambda: ({norm})(ref {op} {o}), 's {op} {o}')")
@@ -649,6 +676,9 @@ def ops_set(t: Target, r: random.Random) -> str:
                 f"'bisect_' + side + '({x})')")
     elif c == "clear":
         code = "_same(lambda: s.clear(), lambda: ref.clear(), 'clear()')"
+    elif c == "count":
+        code = (f"if hasattr(s, 'count'):\n    _same(lambda: s.count({x}), lambda: 1 if {x} in ref else 0, "
+                f"'count({x})')")
     elif c in ("pop", "index"):
         code = f"_same(lambda: s.add({x}), lambda: ref.add({x}), 'add({x})')"
     else:
@@ -854,7 +884,7 @@ def ddmin(head: str, chunks: list[str], sig: str, head_chunks: int = 0) -> list[
     return fixed + items
 
 
-def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int = 60) -> dict:
+def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int = 60, long: int = 0) -> dict:
     r = random.Random(seed)
     stdlib = set(dir(functools))
     found = []
@@ -894,6 +924,22 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
     per_job = {}
     sigs = {}
     end = t0 + deadline
+    if long:
+        # Long regression sequences: programs that pass on the code with the repairs accepted so far.
+        # Each drives many paths, so it guards against more single defects than a shrunk failure does.
+        for label, head, make, nfixed in jobs:
+            if nfixed or time.time() > end:
+                continue
+            for _ in range(long):
+                for _try_ in range(5):
+                    chunks = [c for _k in range(5) for c in make(r)]
+                    stats["programs"] += 1
+                    if _run(head + "\n".join(chunks)) is None and _run(head + "\n".join(chunks)) is None:
+                        found.append({"label": label, "sig": "long", "body": "\n".join(chunks), "head": head})
+                        per_job[label] = per_job.get(label, 0) + 1
+                        break
+        stats["found"] = per_job
+        return {"tests": found, "stats": stats}
     while jobs and time.time() < end and len(found) < max_tests:
         for label, head, make, nfixed in list(jobs):
             if time.time() > end or len(found) >= max_tests:
@@ -958,7 +1004,10 @@ def shadow_package(pkg: str, fixes: list[str]) -> str | None:
         return None
     pkg_dir = Path(spec.origin).parent
     base = pkg_dir.parent
-    tmp = Path(tempfile.mkdtemp(prefix="tagent_shadow_"))
+    import atexit
+    # scratch copy inside the workspace (hidden, so pytest does not collect it), removed on exit
+    tmp = Path(tempfile.mkdtemp(prefix=".tagent_shadow_", dir=Path.cwd()))
+    atexit.register(shutil.rmtree, tmp, True)
     shutil.copytree(pkg_dir, tmp / pkg_dir.name, ignore=shutil.ignore_patterns("__pycache__"))
     by_file: dict[str, list] = {}
     for site in fixes:
@@ -998,7 +1047,8 @@ def main():
     except Exception:  # noqa: BLE001 - fall back to the real code
         pass
     res = fuzz(req["package"], float(req.get("deadline", 60)), int(req.get("seed", 1)),
-               per_sig=int(req.get("per_sig", 2)), max_tests=int(req.get("max_tests", 60)))
+               per_sig=int(req.get("per_sig", 2)), max_tests=int(req.get("max_tests", 60)),
+               long=int(req.get("long", 0)))
     res["source"] = render(res["tests"]) if res["tests"] else ""
     with open(sys.argv[2], "w") as fh:
         json.dump({"source": res["source"], "stats": res["stats"],

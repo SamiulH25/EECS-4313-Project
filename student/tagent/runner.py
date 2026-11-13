@@ -226,7 +226,33 @@ class Runner:
 
 
 TEST_BUG_EXC = ("NameError", "SyntaxError", "ImportError", "ModuleNotFoundError", "UnboundLocalError",
-                "fixture", "IndentationError")
+                "fixture", "IndentationError", "InvalidArgument", "FailedHealthCheck", "Unsatisfiable",
+                "InvalidDefinition", "HypothesisDeprecationWarning")
+
+
+def strip_pointless_settings(src: str) -> str:
+    """Remove `@settings(...)` from tests without `@given` (Hypothesis rejects that combination at run
+    time, on correct code too)."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    drop = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        names = []
+        for d in node.decorator_list:
+            f = d.func if isinstance(d, ast.Call) else d
+            names.append(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+        if "given" in names:
+            continue
+        for d, n in zip(node.decorator_list, names):
+            if n == "settings":
+                drop.update(range(d.lineno, d.end_lineno + 1))
+    if not drop:
+        return src
+    return "\n".join(l for i, l in enumerate(src.splitlines(), 1) if i not in drop) + "\n"
 
 
 def triage_auto(tr: TestResult, test_file: str, package: str) -> str:

@@ -12,7 +12,7 @@ from pathlib import Path
 
 FORBIDDEN_MODULES = {"inspect", "os", "io", "pathlib", "importlib", "linecache", "dis", "subprocess", "shutil",
                      "glob", "marshal", "ast", "tokenize", "pkgutil", "runpy", "sys", "gc", "ctypes", "mmap",
-                     "tempfile", "socket", "requests", "urllib", "threading", "multiprocessing"}
+                     "tempfile", "socket", "requests", "urllib", "multiprocessing"}
 FORBIDDEN_NAMES = {"open", "exec", "eval", "compile", "globals", "vars", "__import__", "breakpoint"}
 FORBIDDEN_ATTRS = {"__code__", "__file__", "__globals__", "__loader__", "__spec__", "__path__", "modules",
                    "getsource", "getsourcelines", "read_text", "read_bytes", "co_code", "f_code"}
@@ -47,6 +47,87 @@ def static_problem(src: str) -> str:
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
             return f"uses .{node.attr} (not allowed)"
     return ""
+
+
+def _node_problem(node) -> bool:
+    return any(static_problem_node(n) for n in ast.walk(node))
+
+
+def static_problem_node(node) -> str:
+    if isinstance(node, ast.Import):
+        names = {a.name.split(".")[0] for a in node.names}
+    elif isinstance(node, ast.ImportFrom):
+        names = {(node.module or "").split(".")[0]}
+    else:
+        names = set()
+    if names & FORBIDDEN_MODULES:
+        return "module"
+    if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+        return "name"
+    if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
+        return "attr"
+    return ""
+
+
+def _blocks(src: str) -> list[str]:
+    """Split a module into top-level blocks (a decorated def/class stays with its decorators)."""
+    blocks, cur = [], []
+    for line in src.splitlines(keepends=True):
+        top = line[:1] not in (" ", "\t", "\n", "\r", "#", ")", "]", "}") and line.strip() != ""
+        if top and cur and not (cur and all(l.lstrip().startswith("@") or not l.strip() for l in cur)):
+            blocks.append("".join(cur))
+            cur = []
+        cur.append(line)
+    if cur:
+        blocks.append("".join(cur))
+    return blocks
+
+
+def _parses(src: str) -> bool:
+    try:
+        ast.parse(src)
+        return True
+    except SyntaxError:
+        return False
+
+
+def salvage(src: str) -> str:
+    """Keep the parts of a generated test file that are valid: drop top-level blocks that break the
+    syntax, and drop tests/helpers/imports that use something the evaluator forbids."""
+    if not _parses(src):
+        kept = ""
+        for b in _blocks(src):
+            if _parses(kept + b):
+                kept += b
+        src = kept
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return ""
+    bad_names = set()
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and static_problem_node(node):
+            bad_names.update((a.asname or a.name).split(".")[0] for a in node.names)
+            continue
+        body.append(node)
+
+    def uses_bad(n):
+        return _node_problem(n) or any(isinstance(x, ast.Name) and x.id in bad_names for x in ast.walk(n))
+    out = []
+    for node in body:
+        if isinstance(node, ast.ClassDef):
+            node.body = [n for n in node.body if not uses_bad(n)] or [ast.Pass()]
+            if uses_bad(node):
+                continue
+        elif uses_bad(node):
+            continue
+        out.append(node)
+    tree.body = out
+    try:
+        return ast.unparse(tree) + "\n"
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 @dataclass

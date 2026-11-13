@@ -30,7 +30,7 @@ from minisweagent.exceptions import LimitsExceeded
 
 from . import doctests, inventory
 from .llm import LLM, heredoc_body
-from .runner import CONFTEST, Runner, TestResult, static_problem, triage_auto
+from .runner import salvage, CONFTEST, Runner, TestResult, static_problem, triage_auto
 
 WORKERS = 4
 JOB_RESERVE = 30_000        # do not start a unit job with fewer tokens left than this
@@ -327,10 +327,19 @@ class Pipeline:
         body = self._with_imports(u, body)
         problem = static_problem(body)
         if problem:
-            body = self._repair(rel, body, problem)
-            if not body or static_problem(body):
-                return
-            body = self._with_imports(u, body)
+            saved = salvage(body)
+            n_tests = len(re.findall(r"^\s*def test_", saved, re.M))
+            if saved and not static_problem(saved) and n_tests >= 3:
+                body = self._with_imports(u, saved)       # keep the valid tests; no model call needed
+            else:
+                fixed = self._repair(rel, body, problem, u)
+                if fixed and static_problem(fixed):
+                    fixed = salvage(fixed)
+                if not fixed or static_problem(fixed):
+                    if not saved or static_problem(saved) or not n_tests:
+                        return
+                    fixed = saved
+                body = self._with_imports(u, fixed)
         path = self.ws / rel
         path.write_text(body)
         tests, coll, out = self.runner.results([rel], repeats=2, coverage=self.arcs)

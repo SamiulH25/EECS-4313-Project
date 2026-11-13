@@ -1,0 +1,8 @@
+{
+ "name": "cachetools",
+ "package": "cachetools",
+ "summary": "Extensible memoizing collections and decorators: LRU, LFU, TTL, FIFO, MRU and RR caches.",
+ "bugs": 20,
+ "given_tests": 196,
+ "original_tests": 215
+}

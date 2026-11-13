@@ -1,0 +1,222 @@
+[
+ {
+  "id": "sortedlist-2047-6a756dd1",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 2047,
+  "operator": "constant",
+  "start": 58065,
+  "end": 58066,
+  "original": "1",
+  "replacement": "2",
+  "function": "SortedKeyList.remove"
+ },
+ {
+  "id": "sortedlist-1665-5b2d934b",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1665,
+  "operator": "comparison",
+  "start": 47403,
+  "end": 47405,
+  "original": ">=",
+  "replacement": ">",
+  "function": "SortedList._check"
+ },
+ {
+  "id": "sorteddict-483-5f5d56d1",
+  "file": "sortedcontainers/sorteddict.py",
+  "line": 483,
+  "operator": "constant",
+  "start": 14166,
+  "end": 14167,
+  "original": "1",
+  "replacement": "2",
+  "function": "SortedDict.peekitem"
+ },
+ {
+  "id": "sortedlist-411-908d90ba",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 411,
+  "operator": "remove_not",
+  "start": 10992,
+  "end": 10996,
+  "original": "not ",
+  "replacement": "",
+  "function": "SortedList.discard"
+ },
+ {
+  "id": "sortedlist-1946-a9b457f5",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1946,
+  "operator": "comparison",
+  "start": 55307,
+  "end": 55309,
+  "original": "==",
+  "replacement": "!=",
+  "function": "SortedKeyList.__contains__"
+ },
+ {
+  "id": "sortedlist-1992-14ae0870",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1992,
+  "operator": "constant",
+  "start": 56466,
+  "end": 56467,
+  "original": "1",
+  "replacement": "2",
+  "function": "SortedKeyList.discard"
+ },
+ {
+  "id": "sortedlist-1943-281a9af4",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1943,
+  "operator": "arithmetic",
+  "start": 55219,
+  "end": 55221,
+  "original": "+=",
+  "replacement": "-=",
+  "function": "SortedKeyList.__contains__"
+ },
+ {
+  "id": "sortedlist-1422-e3c20c9c",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1422,
+  "operator": "arithmetic",
+  "start": 40462,
+  "end": 40464,
+  "original": "+=",
+  "replacement": "-=",
+  "function": "SortedList.index"
+ },
+ {
+  "id": "sortedset-209-e1cd3889",
+  "file": "sortedcontainers/sortedset.py",
+  "line": 209,
+  "operator": "comparison",
+  "start": 6336,
+  "end": 6338,
+  "original": "in",
+  "replacement": "not in",
+  "function": "SortedSet.__contains__"
+ },
+ {
+  "id": "sortedlist-2226-a8ee6781",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 2226,
+  "operator": "arithmetic",
+  "start": 63963,
+  "end": 63965,
+  "original": "-=",
+  "replacement": "+=",
+  "function": "SortedKeyList.irange_key"
+ },
+ {
+  "id": "sortedlist-1253-a2aae0c6",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1253,
+  "operator": "comparison",
+  "start": 36037,
+  "end": 36039,
+  "original": "==",
+  "replacement": "!=",
+  "function": "SortedList.count"
+ },
+ {
+  "id": "sortedlist-1664-a1fbf26e",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1664,
+  "operator": "constant",
+  "start": 47367,
+  "end": 47368,
+  "original": "1",
+  "replacement": "2",
+  "function": "SortedList._check"
+ },
+ {
+  "id": "sortedlist-789-eb6b3530",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 789,
+  "operator": "boolean",
+  "start": 21851,
+  "end": 21854,
+  "original": "and",
+  "replacement": "or",
+  "function": "SortedList.__delitem__"
+ },
+ {
+  "id": "sortedset-400-0ae45178",
+  "file": "sortedcontainers/sortedset.py",
+  "line": 400,
+  "operator": "constant",
+  "start": 11018,
+  "end": 11019,
+  "original": "0",
+  "replacement": "1",
+  "function": "SortedSet.count"
+ },
+ {
+  "id": "sortedlist-379-f462d251",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 379,
+  "operator": "remove_not",
+  "start": 10283,
+  "end": 10287,
+  "original": "not ",
+  "replacement": "",
+  "function": "SortedList.__contains__"
+ },
+ {
+  "id": "sortedlist-2472-62109d7a",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 2472,
+  "operator": "constant",
+  "start": 70536,
+  "end": 70537,
+  "original": "1",
+  "replacement": "0",
+  "function": "SortedKeyList.index"
+ },
+ {
+  "id": "sortedlist-1994-1dd91f87",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1994,
+  "operator": "constant",
+  "start": 56526,
+  "end": 56527,
+  "original": "1",
+  "replacement": "2",
+  "function": "SortedKeyList.discard"
+ },
+ {
+  "id": "sortedlist-1415-f4e70772",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1415,
+  "operator": "arithmetic",
+  "start": 40322,
+  "end": 40324,
+  "original": "+=",
+  "replacement": "-=",
+  "function": "SortedList.index"
+ },
+ {
+  "id": "sorteddict-447-a81e8156",
+  "file": "sortedcontainers/sorteddict.py",
+  "line": 447,
+  "operator": "constant",
+  "start": 13069,
+  "end": 13070,
+  "original": "1",
+  "replacement": "0",
+  "function": "SortedDict.popitem"
+ },
+ {
+  "id": "sortedlist-1187-1e9807de",
+  "file": "sortedcontainers/sortedlist.py",
+  "line": 1187,
+  "operator": "constant",
+  "start": 34468,
+  "end": 34469,
+  "original": "0",
+  "replacement": "1",
+  "function": "SortedList.bisect_left"
+ }
+]

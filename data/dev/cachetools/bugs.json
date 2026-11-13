@@ -1,0 +1,222 @@
+[
+ {
+  "id": "func-61-577d5c5d",
+  "file": "cachetools/func.py",
+  "line": 61,
+  "operator": "constant",
+  "start": 1686,
+  "end": 1689,
+  "original": "128",
+  "replacement": "127",
+  "function": "lfu_cache"
+ },
+ {
+  "id": "__init__-574-2c9defcb",
+  "file": "cachetools/__init__.py",
+  "line": 574,
+  "operator": "comparison",
+  "start": 16727,
+  "end": 16728,
+  "original": "<",
+  "replacement": "<=",
+  "function": "TLRUCache.__delitem__"
+ },
+ {
+  "id": "__init__-581-4381440f",
+  "file": "cachetools/__init__.py",
+  "line": 581,
+  "operator": "boolean",
+  "start": 16959,
+  "end": 16962,
+  "original": "and",
+  "replacement": "or",
+  "function": "TLRUCache.__iter__"
+ },
+ {
+  "id": "__init__-664-bb4d8d66",
+  "file": "cachetools/__init__.py",
+  "line": 664,
+  "operator": "constant",
+  "start": 19543,
+  "end": 19544,
+  "original": "0",
+  "replacement": "1",
+  "function": "cached.decorator.getinfo"
+ },
+ {
+  "id": "__init__-181-efd2101d",
+  "file": "cachetools/__init__.py",
+  "line": 181,
+  "operator": "arithmetic",
+  "start": 4551,
+  "end": 4553,
+  "original": "-=",
+  "replacement": "+=",
+  "function": "LFUCache.__getitem__"
+ },
+ {
+  "id": "func-106-548ffabe",
+  "file": "cachetools/func.py",
+  "line": 106,
+  "operator": "constant",
+  "start": 3068,
+  "end": 3071,
+  "original": "128",
+  "replacement": "129",
+  "function": "rr_cache"
+ },
+ {
+  "id": "__init__-848-afcec03f",
+  "file": "cachetools/__init__.py",
+  "line": 848,
+  "operator": "comparison",
+  "start": 25260,
+  "end": 25266,
+  "original": "is not",
+  "replacement": "is",
+  "function": "cachedmethod.decorator.clear"
+ },
+ {
+  "id": "func-92-d8aaf991",
+  "file": "cachetools/func.py",
+  "line": 92,
+  "operator": "constant",
+  "start": 2635,
+  "end": 2638,
+  "original": "128",
+  "replacement": "127",
+  "function": "mru_cache"
+ },
+ {
+  "id": "__init__-594-69b2d30b",
+  "file": "cachetools/__init__.py",
+  "line": 594,
+  "operator": "comparison",
+  "start": 17318,
+  "end": 17320,
+  "original": "is",
+  "replacement": "is not",
+  "function": "TLRUCache.expire"
+ },
+ {
+  "id": "__init__-675-f0be1827",
+  "file": "cachetools/__init__.py",
+  "line": 675,
+  "operator": "constant",
+  "start": 19855,
+  "end": 19856,
+  "original": "0",
+  "replacement": "1",
+  "function": "cached.decorator.cache_clear"
+ },
+ {
+  "id": "__init__-441-60f9fa4c",
+  "file": "cachetools/__init__.py",
+  "line": 441,
+  "operator": "comparison",
+  "start": 12435,
+  "end": 12436,
+  "original": "<",
+  "replacement": "<=",
+  "function": "TTLCache.__delitem__"
+ },
+ {
+  "id": "func-75-4bdd90c1",
+  "file": "cachetools/func.py",
+  "line": 75,
+  "operator": "constant",
+  "start": 2113,
+  "end": 2116,
+  "original": "128",
+  "replacement": "129",
+  "function": "lru_cache"
+ },
+ {
+  "id": "func-119-5ef15507",
+  "file": "cachetools/func.py",
+  "line": 119,
+  "operator": "constant",
+  "start": 3619,
+  "end": 3622,
+  "original": "128",
+  "replacement": "127",
+  "function": "ttl_cache"
+ },
+ {
+  "id": "__init__-555-9156bb1d",
+  "file": "cachetools/__init__.py",
+  "line": 555,
+  "operator": "comparison",
+  "start": 15971,
+  "end": 15972,
+  "original": "<",
+  "replacement": "<=",
+  "function": "TLRUCache.__setitem__"
+ },
+ {
+  "id": "func-47-44b07a8a",
+  "file": "cachetools/func.py",
+  "line": 47,
+  "operator": "constant",
+  "start": 1268,
+  "end": 1271,
+  "original": "128",
+  "replacement": "127",
+  "function": "fifo_cache"
+ },
+ {
+  "id": "__init__-670-78a2b942",
+  "file": "cachetools/__init__.py",
+  "line": 670,
+  "operator": "constant",
+  "start": 19690,
+  "end": 19691,
+  "original": "1",
+  "replacement": "2",
+  "function": "cached.decorator.wrapper"
+ },
+ {
+  "id": "__init__-823-caf42b63",
+  "file": "cachetools/__init__.py",
+  "line": 823,
+  "operator": "comparison",
+  "start": 24420,
+  "end": 24426,
+  "original": "is not",
+  "replacement": "is",
+  "function": "cachedmethod.decorator.clear"
+ },
+ {
+  "id": "__init__-546-1f452b90",
+  "file": "cachetools/__init__.py",
+  "line": 546,
+  "operator": "comparison",
+  "start": 15654,
+  "end": 15655,
+  "original": "<",
+  "replacement": "<=",
+  "function": "TLRUCache.__getitem__"
+ },
+ {
+  "id": "__init__-416-26ae3e21",
+  "file": "cachetools/__init__.py",
+  "line": 416,
+  "operator": "comparison",
+  "start": 11603,
+  "end": 11604,
+  "original": "<",
+  "replacement": "<=",
+  "function": "TTLCache.__getitem__"
+ },
+ {
+  "id": "__init__-686-c06d53e8",
+  "file": "cachetools/__init__.py",
+  "line": 686,
+  "operator": "constant",
+  "start": 20160,
+  "end": 20161,
+  "original": "1",
+  "replacement": "0",
+  "function": "cached.decorator.wrapper"
+ }
+]

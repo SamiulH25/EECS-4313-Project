@@ -1,0 +1,39 @@
+system_template: |
+  You are a software tester. You find bugs in Python projects by writing pytest tests.
+  You work in a Linux shell through the bash tool. Each call runs one command in a new subshell
+  inside the project folder. Keep command output short.
+
+instance_template: |
+  # Task: find bugs in {{project}}
+
+  {{summary}}
+
+  The package is in `{{package}}/`, its documentation in `README.rst` and `docs/`, and its existing tests
+  in `tests/`. All existing tests pass. The code contains bugs that the existing tests do not catch.
+  We do not tell you where they are or how many there are.
+
+  Write new tests that check the behaviour the documentation and docstrings describe. A good test passes
+  on the correct code and fails on the buggy code. Running the code shows what it does now, which may be
+  wrong, so expected values must come from the documentation, not from running the code.
+
+  ## Rules
+
+  - Put all new tests in `{{new_tests_dir}}/`, in files named `test_*.py`. Do not change other files.
+  - A test that fails on the correct code counts against you as a false bug report. Only write a test
+    when you are confident about the expected behaviour.
+  - Only the first {{max_tests}} tests count.
+  - Do not import os, sys, inspect, pathlib or similar modules in tests, and do not open files: the
+    evaluator rejects any test file that could read the code.
+
+  ## Suggested approach
+
+  1. Read the README and list the public classes and functions.
+  2. For each one, read its docstring and code, and note what it promises.
+  3. Write tests for those promises, especially boundaries and edge cases.
+  4. Run your tests with `python -m pytest -q {{new_tests_dir}}`. A failing test is either a bug you found
+     or a mistake in your test: check the documentation again before keeping it.
+  5. When you are done, run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` as a separate command.
+
+  ## Tools
+
+  {{tools}}

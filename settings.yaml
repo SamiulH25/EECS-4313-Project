@@ -12,23 +12,15 @@ model:
         - fp8
 
 limits:
-  token_limit: 100000
-  step_limit: 40
-  cost_limit: 0.05
-  wall_time_limit_seconds: 900
+  token_limit: 400000
+  step_limit: 120
   command_timeout_seconds: 120
-  blackbox:
-    max_calls: 25
-  whitebox:
-    token_limit: 150000
-    step_limit: 50
-    max_calls: 50
-  combined:
-    token_limit: 250000
-    step_limit: 90
-    max_calls: 50
-  final:
-    max_calls: 50
+
+evaluation:
+  max_tests: 300
+  test_timeout_seconds: 10
+  suite_timeout_seconds: 300
+  false_alarm_weight: 0.5
 
 observation_template: |
   {% if output.exception_info -%}

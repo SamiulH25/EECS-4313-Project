@@ -1,0 +1,8 @@
+{
+ "name": "sortedcontainers",
+ "package": "sortedcontainers",
+ "summary": "Sorted list, sorted dict and sorted set types in pure Python.",
+ "bugs": 20,
+ "given_tests": 274,
+ "original_tests": 291
+}

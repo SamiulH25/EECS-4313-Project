@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""check_tests: check the new tests in ./tests_new without measuring them.
+
+Usage: check_tests
+
+Reports syntax errors, collection errors, the number of collected tests, test functions without an
+assertion, and files the evaluator would reject (for example because they import os or call open).
+It does not tell you whether a test is right: a failing test is either a bug or a wrong expectation.
+"""
+
+import ast
+import subprocess
+import sys
+from pathlib import Path
+
+from testagent.evaluate import source_access
+
+
+def has_assertion(func: ast.AST) -> bool:
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assert):
+            return True
+        if isinstance(node, ast.With) and any("raises" in ast.unparse(i.context_expr) for i in node.items):
+            return True
+        if isinstance(node, ast.Call) and "assert" in ast.unparse(node.func):
+            return True
+    return False
+
+
+def main() -> int:
+    if "--help" in sys.argv[1:]:
+        print(__doc__.strip())
+        return 0
+    files = sorted(Path("tests_new").rglob("test_*.py"))
+    if not files:
+        print("No test files found (expected tests_new/test_*.py).")
+        return 1
+    problems = 0
+    for path in files:
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError as error:
+            print(f"{path}: syntax error on line {error.lineno}: {error.msg}")
+            problems += 1
+            continue
+        reason = source_access(path)
+        if reason:
+            print(f"{path}: the evaluator will reject this whole file because it {reason}")
+            problems += 1
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test") and not has_assertion(node):
+                print(f"{path}::{node.name} has no assertion")
+                problems += 1
+    result = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+                             "tests_new"], capture_output=True, text=True, timeout=120)
+    lines = [l for l in result.stdout.splitlines() if l.strip()]
+    print(lines[-1] if lines else result.stderr.strip()[-500:])
+    if result.returncode not in (0, 5):
+        print("\n".join(lines[-15:]))
+        problems += 1
+    print("OK" if not problems else f"{problems} problem(s) found")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

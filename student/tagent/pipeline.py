@@ -274,7 +274,7 @@ class Pipeline:
         if notes:
             prev = ("\n## Tests already written for this unit in earlier rounds\n"
                     "Do not repeat them; target other methods, other risk points and other boundaries.\n"
-                    + "\n".join(notes[-40:]) + "\n")
+                    + "\n".join(notes[-30:]) + "\n")
         gaps = self.uncovered(u) if rnd > 1 else []
         if gaps:
             prev += ("\n## Branches and risk points that NO test has exercised yet (coverage)\n"
@@ -282,10 +282,12 @@ class Pipeline:
                      + "\n".join(f"- {g}" for g in gaps) + "\n")
         return _fill(self.gen_prompt[1], project=self.task.project, summary=self.task.summary, title=u.title,
                      import_hint=u.import_hint,
-                     docs=inventory.docs_for(u, self.sections) or "(none found)",
+                     # later rounds: the notes carry what was learnt, so the reference material is trimmed
+                     docs=inventory.docs_for(u, self.sections, 4500 if rnd == 1 else 3000) or "(none found)",
                      outline=u.outline or "(module-level functions)", source=u.source,
                      risks="\n".join(u.risks) or "(none detected)",
-                     existing=inventory.existing_tests_for(self.ws, u) or "# (none)",
+                     existing=(inventory.existing_tests_for(self.ws, u) or "# (none)") if rnd == 1
+                     else "# (see round 1; omitted)",
                      previous=prev, n_tests="10 to 14", path=rel)
 
     def _repair(self, rel: str, body: str, problem: str, u=None) -> str | None:

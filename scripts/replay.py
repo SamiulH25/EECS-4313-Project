@@ -68,6 +68,9 @@ def main():
         total["fa"] += res["false_alarms"]
         total["bugs"] += res["bugs"]
         (out_dir / "evaluation.json").write_text(json.dumps(res, indent=1))
+        shutil.rmtree(out_dir / "cands", ignore_errors=True)
+        if (ws / "_cand").is_dir():
+            shutil.copytree(ws / "_cand", out_dir / "cands", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.rmtree(ws.parent, ignore_errors=True)
     print(f"TOTAL found {total['found']}/{total['bugs']}, FA {total['fa']}, score {total['found'] - 0.5 * total['fa']}")
 

@@ -36,7 +36,7 @@ WORKERS = 4
 JOB_RESERVE = 30_000        # do not start a unit job with fewer tokens left than this
 MAX_PER_LOCATION = 2        # kept tests per repaired location
 USE_JUDGE = False
-USE_BOUNDARY_VOTE = True           # the LLM judge was too permissive; the repair check replaces it
+USE_BOUNDARY_VOTE = False   # the 9B model voted the wrong way; sibling evidence is used instead           # the LLM judge was too permissive; the repair check replaces it
 MAX_TESTS = 300
 
 
@@ -365,6 +365,11 @@ class Pipeline:
                     notes.append(f"- {t.func}: passed (behaviour already correct)")
                 elif t in cands:
                     notes.append(f"- {t.func}: failed, but its expectation looks wrong (no small fix explains it)")
+                elif t.outcome == "failed":
+                    msg = ((t.crash or [None, None, ""])[2] or t.text[-200:] or "").strip().splitlines()
+                    msg = msg[0][:160] if msg else "?"
+                    notes.append(f"- {t.func}: CRASHED inside the test code ({msg}); "
+                                 "the test used the API wrongly: check the signatures and docs")
             if keep:
                 self.sources[rel] = body
                 self.kept[rel] = keep
@@ -415,8 +420,14 @@ class Pipeline:
             for key in ("baseline", "explained", "sites"):
                 res[key].update(part.get(key) or {})
             res["notes"] += part.get("notes") or ["(no result)"]
+            for key in ("errors", "guard_errors", "guard_rejected", "suite_ok"):
+                res.setdefault(key, {}).update(part.get(key) or {})
+            res.setdefault("sibling_rejected", []).extend(part.get("sibling_rejected") or [])
         self.llm.note("repair", file=rel, notes=res.get("notes"), explained=res.get("explained"),
-                      baseline_passing=[t for t, ok in (res.get("baseline") or {}).items() if ok])
+                      baseline_passing=[t for t, ok in (res.get("baseline") or {}).items() if ok],
+                      errors=res.get("errors"), guard_errors=res.get("guard_errors"),
+                      guard_rejected=res.get("guard_rejected"), suite_ok=res.get("suite_ok"),
+                      sibling_rejected=res.get("sibling_rejected"))
         keep, located = set(), {}
         # Boundary flips (< vs <=) are where the model most often guesses wrongly at an undocumented
         # edge: ask several independent focused questions before trusting one.

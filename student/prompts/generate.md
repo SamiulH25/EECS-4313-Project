@@ -58,12 +58,36 @@ Techniques to use:
    constants (thousands of elements, built with range()), or set the documented size/load
    parameter small, and compare against the reference.
 4. Cross-method consistency at boundaries (metamorphic): when the docs do not say whether a boundary
-   is inclusive (e.g. does an item expire exactly at its expiry time? is index == len valid?), do NOT
-   guess. Instead put the object exactly at the boundary and assert that all ways of observing it
-   agree: `k in c` vs `c.get(k)` vs `c[k]` raising KeyError vs `del c[k]` vs `k in list(c)` vs
-   `len(c)`, or `x in s` vs `s.count(x) > 0` vs `s.index(x)`, `bisect_left` vs `bisect_right`, etc.
-5. Metamorphic checks where natural (e.g. inserting then removing restores the state; order of
+   is inclusive (e.g. does an item expire exactly at its expiry time? is index == len valid?), NEVER
+   assert a guessed value there. Put the object exactly at the boundary and compare exactly TWO ways
+   of observing it per test (one test per pair), for example:
+   ```python
+   def test_contains_agrees_with_getitem_at_boundary():
+       ...  # build the object, move it exactly onto the boundary
+       try:
+           c[k]
+           reachable = True
+       except KeyError:
+           reachable = False
+       assert (k in c) == reachable
+   ```
+   Useful pairs: `k in c` vs `c[k]`; `k in c` vs `del c[k]` succeeding; `k in c` vs `k in list(c)`;
+   `len(c)` vs `len(list(c))`; `c.get(k, sentinel)` vs `k in c`; `x in s` vs `s.count(x) > 0`;
+   `s.index(x)` vs `bisect_left`; `pop(i)` vs `s[i]` read just before.
+   Also check that inserting at the boundary and reading back agree (`c[k] = v` at the boundary time,
+   then `k in c` vs `c.get(k)`).
+5. Equivalent call forms: omitting an argument must behave exactly like passing its documented
+   default explicitly, and alternative documented call forms (e.g. a decorator used bare, with
+   empty parentheses, and with explicit default arguments) must behave identically. Build both
+   versions, drive them with the same calls, and compare everything observable (results, len,
+   statistics/info objects, parameters reported by the API).
+6. Metamorphic checks where natural (e.g. inserting then removing restores the state; order of
    insertion does not change a sorted result).
+
+Reaching the code: a risk point inside a nested function (shown as `in outer.inner`) only runs
+through the public API that creates that function: read the signature and docs to find which
+arguments enable that path (e.g. an optional flag, passing None, using a decorator without
+arguments) and use exactly the documented call forms. Never invent keyword arguments.
 
 Test hygiene:
 - One behaviour per test, at most 4 asserts, descriptive names starting with `test_`.

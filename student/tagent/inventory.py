@@ -65,6 +65,30 @@ def risk_points(tree: ast.AST, src_lines: list[str], spans: list[tuple[int, int]
     def inside(n):
         return any(a <= getattr(n, "lineno", -1) <= b for a, b in spans)
 
+    # The enclosing function of every line (innermost wins), so a risk point inside a nested helper
+    # says how it is reached, e.g. `cached.decorator.getinfo`.
+    owner: dict[int, str] = {}
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                q = f"{prefix}.{child.name}" if prefix else child.name
+                for ln in range(child.lineno, (child.end_lineno or child.lineno) + 1):
+                    owner[ln] = q
+                walk(child, q)
+            else:
+                walk(child, prefix)
+    walk(tree, "")
+
+    # 0/1 are everywhere, but as a call argument or an assigned value (a reset, a reported count)
+    # they are behaviour a test can observe.
+    small = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            small.update(id(a) for a in node.args if isinstance(a, ast.Constant))
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            small.add(id(node.value))
+
     seen = set()
     out = []
     for node in ast.walk(tree):
@@ -97,6 +121,10 @@ def risk_points(tree: ast.AST, src_lines: list[str], spans: list[tuple[int, int]
                 and node.value not in (0, 1, -1):
             text = repr(node.value)
             hint = "documented default/limit? test at, just below and just above it"
+        elif isinstance(node, ast.Constant) and id(node) in small and type(node.value) is int and node.value in (0, 1):
+            seg = src_lines[line - 1].strip()
+            text = seg if len(seg) <= 90 else repr(node.value)
+            hint = f"the value {node.value} here is observable: check it exactly"
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             text = ast.unparse(node)
             hint = "test the condition both ways"
@@ -109,7 +137,8 @@ def risk_points(tree: ast.AST, src_lines: list[str], spans: list[tuple[int, int]
         if key in seen:
             continue
         seen.add(key)
-        out.append((line, f"L{line}: `{text}` -> {hint}"))
+        where = f" in `{owner[line]}`" if line in owner and "." in owner[line] else ""
+        out.append((line, f"L{line}{where}: `{text}` -> {hint}"))
     out.sort()
     return [t for _, t in out][:limit]
 

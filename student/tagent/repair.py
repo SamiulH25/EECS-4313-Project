@@ -155,8 +155,8 @@ def deviates_after(text: str, site: dict) -> bool:
     sibling deviate; repairing it restores agreement. A repair that creates deviation is suspicious."""
     profile = comparison_profile(text)
     me = next((c for c in profile if c["start"] == site["start"]), None)
-    if me is None:
-        return False
+    if me is None or me["op"] in (ast.Is, ast.IsNot, ast.In, ast.NotIn):
+        return False   # identity/membership tests guard different actions; their polarity is not a convention
     mutated = text[: site["start"]] + site["repl"] + text[site["end"]:]
     after = next((c for c in comparison_profile(mutated) if c["start"] in (site["start"], site["start"] + 1)), None)
     if after is None:
@@ -175,6 +175,47 @@ def deviates_after(text: str, site: dict) -> bool:
         return False
     top, count = max(((o, votes.count(o)) for o in set(votes)), key=lambda t: t[1])
     return count / len(votes) >= 0.75 and me["op"] == top and after["op"] != top
+
+
+_STRICT = {ast.Lt: True, ast.Gt: True, ast.LtE: False, ast.GtE: False}
+
+
+def _related(a1: set, b1: set, a2: set, b2: set) -> bool:
+    """Two comparisons talk about the same quantities: both operand pairs overlap, or one pair shares
+    an attribute name (a field such as `.expires` is specific; a local name such as `i` is not)."""
+    if (a1 & b1) and (a2 & b2):
+        return True
+    return any(t.startswith(".") for t in (a1 & b1) | (a2 & b2))
+
+
+def boundary_unsupported(text: str, site: dict) -> bool:
+    """For a repair that only moves a boundary in or out (< vs <=, > vs >=): True when the code's other
+    comparisons over the same operands do not favour the repaired form. Code is consistent about
+    whether a boundary value is included (e.g. an item is expired exactly at its expiry time), so a
+    true repair moves a comparison towards the convention of its siblings. Ties count against."""
+    profile = comparison_profile(text)
+    me = next((c for c in profile if c["start"] == site["start"]), None)
+    if me is None or me["op"] not in _STRICT:
+        return False
+    mutated = text[: site["start"]] + site["repl"] + text[site["end"]:]
+    after = next((c for c in comparison_profile(mutated) if c["start"] in (site["start"], site["start"] + 1)), None)
+    if after is None or after["op"] not in _STRICT or _STRICT[after["op"]] == _STRICT[me["op"]]:
+        return False
+    strict = loose = 0
+    for c in profile:
+        if c is me or c["op"] not in _STRICT:
+            continue
+        same = _related(c["left"], me["left"], c["right"], me["right"])
+        crossed = _related(c["left"], me["right"], c["right"], me["left"])
+        if same != crossed:
+            if _STRICT[c["op"]]:
+                strict += 1
+            else:
+                loose += 1
+    if strict + loose < 2:
+        return False
+    want, against = (strict, loose) if _STRICT[after["op"]] else (loose, strict)
+    return want <= against
 
 
 class _Shape(ast.NodeTransformer):
@@ -315,6 +356,96 @@ def _alarm(signum, frame):
     raise _Timeout()
 
 
+def _param_sets(func) -> list[dict]:
+    """The argument combinations of `@pytest.mark.parametrize` marks (all of them are run)."""
+    combos = [{}]
+    for mark in getattr(func, "pytestmark", []) or []:
+        if getattr(mark, "name", "") != "parametrize" or not mark.args:
+            continue
+        names = mark.args[0]
+        names = [n.strip() for n in names.split(",")] if isinstance(names, str) else list(names)
+        values = mark.args[1] if len(mark.args) > 1 else mark.kwargs.get("argvalues", [])
+        rows = []
+        for v in values:
+            v = getattr(v, "values", v)              # pytest.param(...)
+            if len(names) == 1:
+                v = v[0] if hasattr(values[0] if values else None, "values") else v
+                rows.append({names[0]: v})
+            else:
+                rows.append(dict(zip(names, v)))
+        combos = [dict(c, **r) for c in combos for r in rows] or combos
+    return combos
+
+
+def _fixture(mod, owner, name, stack, depth=0):
+    fx = getattr(owner, name, None) if owner is not None else None
+    if fx is None:
+        fx = getattr(mod, name, None)
+    raw = getattr(fx, "_get_wrapped_function", None)
+    func = raw() if raw else getattr(fx, "__wrapped__", None)
+    if func is None or depth > 5:
+        raise TypeError(f"unsupported fixture {name}")
+    sig = __import__("inspect").signature(func)
+    args = {}
+    for p in sig.parameters.values():
+        if p.name in ("self", "cls"):
+            continue
+        if p.name == "request":
+            raise TypeError("fixture uses request")
+        args[p.name] = _fixture(mod, owner, p.name, stack, depth + 1)
+    if owner is not None and "self" in sig.parameters:
+        value = func(owner, **args)
+    else:
+        value = func(**args)
+    if hasattr(value, "__next__") and hasattr(value, "send"):
+        gen = value
+        value = next(gen)
+        stack.append(gen)
+    return value
+
+
+_CURRENT_ID = [""]   # the [...] part of the test id being run
+
+
+def _call_with_params(func, mod, owner):
+    """Call a test function, supplying parametrize arguments and simple fixtures like pytest does."""
+    import inspect as _inspect
+    base = getattr(func, "__func__", func)
+    try:
+        params = [p.name for p in _inspect.signature(func).parameters.values()]
+    except (TypeError, ValueError):
+        params = []
+    if not params:
+        func()
+        return
+    combos = _param_sets(base)
+    if len(combos) > 1 and _CURRENT_ID[0]:
+        def ident(v, n, i):
+            if isinstance(v, (int, float, str, bool, type(None))) and not (isinstance(v, str) and not v.isprintable()):
+                return str(v)
+            return f"{n}{i}"
+        ids = []
+        for i, c in enumerate(combos):
+            ids.append("-".join(ident(v, n, i) for n, v in c.items()))
+        match = [c for c, x in zip(combos, ids) if x == _CURRENT_ID[0]]
+        if len(match) == 1:
+            combos = match
+    for combo in combos:
+        stack: list = []
+        kwargs = dict(combo)
+        for name in params:
+            if name not in kwargs:
+                kwargs[name] = _fixture(mod, owner, name, stack)
+        try:
+            func(**kwargs)
+        finally:
+            for gen in reversed(stack):
+                try:
+                    next(gen)
+                except StopIteration:
+                    pass
+
+
 class InProcess:
     """Import the package from a scratch copy and run single test functions without pytest."""
 
@@ -323,6 +454,7 @@ class InProcess:
         self.ws = workspace
         self.package = package
         self.counter = 0
+        self.errors: dict[str, str] = {}
         sys.path[:] = [str(root), str(workspace)] + [p for p in sys.path if p not in ("", str(workspace))]
 
     def purge(self):
@@ -349,7 +481,8 @@ class InProcess:
                     spec.loader.exec_module(mod)
                     modules[path] = mod
                 mod = modules[path]
-            except BaseException:  # noqa: BLE001
+            except BaseException as e:  # noqa: BLE001
+                self.errors[tid] = "import: " + f"{type(e).__name__}: {e}"[:200]
                 results[tid] = False
                 continue
             results[tid] = self._call(mod, rest, timeout, tid, trace_lines)
@@ -357,6 +490,7 @@ class InProcess:
 
     def _call(self, mod, rest, timeout, tid, trace_lines) -> bool:
         name = rest[-1].split("[")[0]
+        _CURRENT_ID[0] = rest[-1][len(name) + 1:-1] if "[" in rest[-1] else ""
         try:
             if len(rest) == 2:
                 cls = getattr(mod, rest[0])
@@ -367,15 +501,21 @@ class InProcess:
                         if res.errors or res.failures:
                             raise AssertionError("unittest failure")
                 else:
-                    inst = cls()
-
                     def fn():
+                        inst = cls()
                         if hasattr(inst, "setup_method"):
-                            inst.setup_method(getattr(inst, name))
-                        getattr(inst, name)()
+                            try:
+                                inst.setup_method(getattr(inst, name))
+                            except TypeError:
+                                inst.setup_method()
+                        _call_with_params(getattr(inst, name), mod, inst)
             else:
-                fn = getattr(mod, name)
-        except BaseException:  # noqa: BLE001
+                target = getattr(mod, name)
+
+                def fn():
+                    _call_with_params(target, mod, None)
+        except BaseException as e:  # noqa: BLE001
+            self.errors[tid] = "lookup: " + f"{type(e).__name__}: {e}"[:200]
             return False
         tracer = None
         if trace_lines is not None:
@@ -397,7 +537,8 @@ class InProcess:
                 sys.settrace(tracer)
             fn()
             return True
-        except BaseException:  # noqa: BLE001
+        except BaseException as e:  # noqa: BLE001
+            self.errors[tid] = f"{type(e).__name__}: {e}"[:200]
             return False
         finally:
             sys.settrace(None)
@@ -466,6 +607,7 @@ def main():
         lines: dict = {}
         baseline = runner.run(tests, trace_lines=lines)
         result["baseline"] = baseline
+        result["errors"] = dict(runner.errors)
         # Guards: tests that pass on the current code (documentation examples and model-written tests
         # that agree with the code). A repair that breaks one of them is not trusted.
         guard_lines: dict = {}
@@ -475,6 +617,7 @@ def main():
             guards = [g for g, ok in runner.run(pool, timeout=2.0, trace_lines=guard_lines,
                                                 budget=min(25.0, max(5.0, deadline - time.time() - 30))).items() if ok]
             result["notes"].append(f"{len(guards)} guards")
+            result["guard_errors"] = dict(list(runner.errors.items())[-8:])
         failing = [t for t in tests if not baseline.get(t)]
         save()
         if req.get("baseline_only"):
@@ -499,7 +642,8 @@ def main():
         sites.sort(key=distance)
         kept_sites = []
         for s in sites:
-            if (s["kind"] == "comparison" and deviates_after(base_texts[s["file"]], s)) or \
+            if (s["kind"] == "comparison" and (deviates_after(base_texts[s["file"]], s)
+                                               or boundary_unsupported(base_texts[s["file"]], s))) or \
                     (s["kind"] == "constant" and (constant_deviates_after(base_texts[s["file"]], s)
                                                   or contradicts_docs(s, base_texts[s["file"]], docnums))):
                 result.setdefault("sibling_rejected", []).append(s["site"])

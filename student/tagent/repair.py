@@ -600,6 +600,18 @@ def main():
         originals = {str(p.relative_to(tmp)): p.read_text() for p in (tmp / pkg).rglob("*.py")}
         fixes = [parse_site(s) for s in req.get("fixes", [])]
         fixes = [f for f in fixes if f["file"] in originals]
+        good = []
+        for f in fixes:                   # a fix that breaks the syntax would poison every later check
+            text = originals[f["file"]]
+            trial = [g for g in good if g["file"] == f["file"]] + [f]
+            for g in sorted(trial, key=lambda g: -g["start"]):
+                text = text[: g["start"]] + g["repl"] + text[g["end"]:]
+            try:
+                ast.parse(text)
+                good.append(f)
+            except SyntaxError:
+                result["notes"].append(f"dropped broken fix {f['site'][:60]}")
+        fixes = good
         apply_sites(tmp, originals, fixes)
         base_texts = {rel: (tmp / rel).read_text() for rel in originals}
         runner = InProcess(tmp, ws, pkg)
@@ -640,6 +652,19 @@ def main():
             lines_ = hot.get(site["file"]) or []
             return min((abs(site["line"] - h) for h in lines_), default=10 ** 6)
         sites.sort(key=distance)
+
+        # Sites are found on the code with the accepted fixes applied; report them in the coordinates
+        # of the original files (which is what callers store and re-apply).
+        def to_original(rel, pos):
+            shift = 0
+            for f in sorted((f for f in fixes if f["file"] == rel), key=lambda f: f["start"]):
+                if f["start"] + shift >= pos:
+                    break
+                shift += len(f["repl"]) - (f["end"] - f["start"])
+            return pos - shift
+        for s_ in sites:
+            a, b = to_original(s_["file"], s_["start"]), to_original(s_["file"], s_["end"])
+            s_["site"] = f"{s_['file']}:{a}:{b}:{s_['repl']}"
         kept_sites = []
         for s in sites:
             if (s["kind"] == "comparison" and (deviates_after(base_texts[s["file"]], s)
@@ -682,7 +707,7 @@ def main():
             if time.time() > deadline + 25:
                 result["notes"].append("deadline reached during suite checks")
                 break
-            apply_sites(tmp, base_texts, [parse_site(site)])
+            apply_sites(tmp, originals, fixes + [parse_site(site)])
             ok = suite_passes(tmp, suite, timeout=40)
             result["suite_ok"][site] = ok
             if ok:

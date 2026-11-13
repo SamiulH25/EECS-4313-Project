@@ -33,10 +33,11 @@ def main():
     clean = work / "clean"
     shutil.copytree(project.code, clean, ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(cands, clean / "tests_new")
-    for _ in range(6):
+    for _ in range(40):
         first = pytest_run(clean, project.package, settings, seed="1")
-        bad = [k.split("::", 1)[1] for k in first if k.startswith("<collection>")]
+        bad = [k.split("::")[1] for k in first if k.startswith("<collection>")]
         if not bad:
+            print("first-run keys:", len(first), [k for k in first if k.startswith("<")][:3])
             break
         for b in bad:
             (clean / b).unlink(missing_ok=True)

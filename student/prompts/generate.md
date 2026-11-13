@@ -81,6 +81,10 @@ Techniques to use:
    empty parentheses, and with explicit default arguments) must behave identically. Build both
    versions, drive them with the same calls, and compare everything observable (results, len,
    statistics/info objects, parameters reported by the API).
+   Likewise, after a reset/clear operation the object must be observably identical to a freshly
+   created one (compare its info/statistics, len and contents with a new object's), and counters
+   such as hits/misses must equal what a reference model counts for the same calls. Never assert a
+   number you read off the code.
 6. Metamorphic checks where natural (e.g. inserting then removing restores the state; order of
    insertion does not change a sorted result).
 

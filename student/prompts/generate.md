@@ -25,6 +25,8 @@ Import it like this: `{{import_hint}}`
 ```
 
 ## Risk points in this code (where an injected bug would sit)
+Lines marked SUSPICIOUS differ from similar code elsewhere and are the most likely bug locations:
+aim at least one test at each of them (the documented or majority behaviour is the correct one).
 {{risks}}
 
 ## How the project's existing tests use it (style and helpers only; these all pass already)

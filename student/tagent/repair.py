@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import re
 import shutil
 import signal
 import subprocess
@@ -176,6 +177,119 @@ def deviates_after(text: str, site: dict) -> bool:
     return count / len(votes) >= 0.75 and me["op"] == top and after["op"] != top
 
 
+class _Shape(ast.NodeTransformer):
+    """Abstract a statement to its shape: names, attributes and numbers become placeholders."""
+
+    def visit_Name(self, node):
+        return ast.copy_location(ast.Name(id="_", ctx=node.ctx), node)
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        return ast.copy_location(ast.Attribute(value=node.value, attr="_", ctx=node.ctx), node)
+
+    def visit_Constant(self, node):
+        if type(node.value) in (int, float):
+            return ast.copy_location(ast.Constant(value="#"), node)
+        return node
+
+
+def constant_shapes(text: str) -> list[dict]:
+    """Statements (or if/while conditions) with numeric constants, grouped by shape."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    starts = _offsets(text)
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Return, ast.Assign, ast.AugAssign, ast.Expr, ast.If, ast.While)):
+            continue
+        target = node.test if isinstance(node, (ast.If, ast.While)) else node
+        consts = tuple(n.value for n in ast.walk(target) if isinstance(n, ast.Constant) and type(n.value) in (int, float))
+        if not consts:
+            continue
+        try:
+            key = ast.unparse(_Shape().visit(ast.parse(ast.unparse(target))))
+        except Exception:  # noqa: BLE001
+            continue
+        if len(key) < 12:
+            continue
+        out.append({"key": key, "consts": consts, "line": node.lineno,
+                    "start": starts[target.lineno - 1] + target.col_offset,
+                    "end": starts[target.end_lineno - 1] + target.end_col_offset})
+    return out
+
+
+def plurality(values: list):
+    """The clearly most common value (at least twice, at least half, more than any other), or None."""
+    counts = sorted(((values.count(v), v) for v in set(values)), key=lambda t: -t[0])
+    if not counts:
+        return None
+    top_n, top = counts[0]
+    second = counts[1][0] if len(counts) > 1 else 0
+    if top_n >= 2 and top_n > second and top_n * 2 >= len(values):
+        return top
+    return None
+
+
+def constant_deviates_after(text: str, site: dict) -> bool:
+    """True if a constant repair makes a statement disagree with the majority of same-shape statements."""
+    before = constant_shapes(text)
+    mine = [c for c in before if c["start"] <= site["start"] and site["end"] <= c["end"]]
+    if not mine:
+        return False
+    me = min(mine, key=lambda c: c["end"] - c["start"])
+    group = [c["consts"] for c in before if c["key"] == me["key"]]
+    if len(group) < 3:
+        return False
+    top = plurality(group)
+    # Rejecting a repair needs a strong majority: with every bug applied, two siblings can share the
+    # same wrong value and win a plain plurality.
+    if top is None or me["consts"] != top or group.count(top) < 3 or group.count(top) * 3 < 2 * len(group):
+        return False
+    mutated = text[: site["start"]] + site["repl"] + text[site["end"]:]
+    shift = len(site["repl"]) - (site["end"] - site["start"])
+    after = [c for c in constant_shapes(mutated) if c["start"] <= site["start"] + 1 and site["end"] + shift <= c["end"] + 1]
+    if not after:
+        return False
+    return min(after, key=lambda c: c["end"] - c["start"])["consts"] != top
+
+
+_NUM = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])")
+
+
+def documented_numbers(workspace: Path, package: str) -> set[str]:
+    """Numbers that appear in the documentation and the package's docstrings."""
+    texts = []
+    for p in list(workspace.glob("*")) + (list((workspace / "docs").rglob("*")) if (workspace / "docs").is_dir() else []):
+        if p.is_file() and p.suffix.lower() in (".rst", ".md", ".txt"):
+            texts.append(p.read_text(encoding="utf-8", errors="replace"))
+    for p in (workspace / package).rglob("*.py"):
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                d = ast.get_docstring(node)
+                if d:
+                    texts.append(d)
+    return set(_NUM.findall("\n".join(texts)))
+
+
+def contradicts_docs(site: dict, text: str, docnums: set[str]) -> bool:
+    """A constant repair that moves a documented value (e.g. a default of 128 stated in the docs) to an
+    undocumented one contradicts the specification."""
+    orig = text[site["start"]:site["end"]].strip()
+    new = site["repl"].strip("()")
+    try:
+        if abs(float(orig)) <= 2:
+            return False
+    except ValueError:
+        return False
+    return orig in docnums and new not in docnums
+
+
 def apply_sites(root: Path, originals: dict[str, str], sites: list[dict]):
     """Write each file in `originals` with the given sites applied (later offsets first)."""
     by_file: dict[str, list[dict]] = {}
@@ -216,11 +330,15 @@ class InProcess:
             if name == self.package or name.startswith(self.package + ".") or name.startswith("_tagent_t"):
                 del sys.modules[name]
 
-    def run(self, tests: list[str], timeout: float = 4.0, trace_lines: dict | None = None) -> dict[str, bool]:
+    def run(self, tests: list[str], timeout: float = 4.0, trace_lines: dict | None = None,
+            budget: float | None = None) -> dict[str, bool]:
         self.purge()
         modules = {}
         results = {}
+        stop_at = time.time() + budget if budget else None
         for tid in tests:
+            if stop_at and time.time() > stop_at:
+                break
             path, *rest = tid.split("::")
             try:
                 if path not in modules:
@@ -298,7 +416,12 @@ def suite_passes(root: Path, suite_dir: str, timeout: int) -> bool:
         return False
 
 
+def _terminate(signum, frame):
+    raise SystemExit(1)
+
+
 def main():
+    signal.signal(signal.SIGTERM, _terminate)
     req = json.loads(Path(sys.argv[1]).read_text())
     out_path = Path(sys.argv[2])
     started = time.time()
@@ -315,9 +438,18 @@ def main():
         from hypothesis import HealthCheck, settings
         settings.register_profile("tagent", derandomize=True, database=None, deadline=None, max_examples=150,
                                   suppress_health_check=list(HealthCheck), print_blob=False)
+        # Screening mutants with fewer examples is much faster; every repair that survives screening
+        # is confirmed with the full profile before it is trusted.
+        settings.register_profile("screen", derandomize=True, database=None, deadline=None, max_examples=25,
+                                  suppress_health_check=list(HealthCheck), print_blob=False)
         settings.load_profile("tagent")
+        profiles = settings
     except Exception:  # noqa: BLE001
-        pass
+        profiles = None
+
+    def profile(name):
+        if profiles is not None:
+            profiles.load_profile(name)
 
     tmp = Path(tempfile.mkdtemp(prefix="tagent-repair-"))
     try:
@@ -337,8 +469,12 @@ def main():
         # Guards: tests that pass on the current code (documentation examples and model-written tests
         # that agree with the code). A repair that breaks one of them is not trusted.
         guard_lines: dict = {}
-        guards = [g for g, ok in runner.run(list(req.get("guards", [])), trace_lines=guard_lines).items() if ok] \
-            if req.get("guards") and not req.get("baseline_only") else []
+        guards = []
+        if req.get("guards") and not req.get("baseline_only"):
+            pool = list(dict.fromkeys(req["guards"]))[-400:]
+            guards = [g for g, ok in runner.run(pool, timeout=2.0, trace_lines=guard_lines,
+                                                budget=min(25.0, max(5.0, deadline - time.time() - 30))).items() if ok]
+            result["notes"].append(f"{len(guards)} guards")
         failing = [t for t in tests if not baseline.get(t)]
         save()
         if req.get("baseline_only"):
@@ -354,9 +490,18 @@ def main():
                 sites += mutation_sites(rel, base_texts[rel], ls)
         result["notes"].append(f"{len(failing)} failing, {len(sites)} mutations on covered lines")
         explains: dict[str, list[str]] = {}
+        docnums = documented_numbers(ws, pkg)
+        hot = req.get("hot", {})   # file -> lines where the failures surfaced; try nearby repairs first
+
+        def distance(site):
+            lines_ = hot.get(site["file"]) or []
+            return min((abs(site["line"] - h) for h in lines_), default=10 ** 6)
+        sites.sort(key=distance)
         kept_sites = []
         for s in sites:
-            if s["kind"] == "comparison" and deviates_after(base_texts[s["file"]], s):
+            if (s["kind"] == "comparison" and deviates_after(base_texts[s["file"]], s)) or \
+                    (s["kind"] == "constant" and (constant_deviates_after(base_texts[s["file"]], s)
+                                                  or contradicts_docs(s, base_texts[s["file"]], docnums))):
                 result.setdefault("sibling_rejected", []).append(s["site"])
                 continue
             kept_sites.append(s)
@@ -370,8 +515,12 @@ def main():
             if not who:
                 continue
             apply_sites(tmp, base_texts, [s])
-            res = runner.run(who, timeout=3.0)
+            profile("screen")
+            res = runner.run(who, timeout=2.0)
+            profile("tagent")
             passed = [t for t, ok in res.items() if ok]
+            if passed:
+                passed = [t for t, ok in runner.run(passed, timeout=4.0).items() if ok]
             if passed:
                 near = [g for g in guards if any(ln in guard_lines.get(g, {}).get(s["file"], ())
                                                  for ln in range(s["line"], s["line"] + 3))][:80]
@@ -381,6 +530,7 @@ def main():
                     continue
                 explains[s["site"]] = passed
                 result["sites"][s["site"]] = {k: s[k] for k in ("file", "line", "kind", "orig", "repl")}
+                save()
         apply_sites(tmp, base_texts, [])
         # The existing suite must still pass with the repair: check the strongest repairs first.
         order = sorted(explains, key=lambda k: -len(explains[k]))

@@ -307,13 +307,15 @@ class Pipeline:
         self.llm.note("kept", file=rel, kept=sorted(keep), located=located, verdicts=verdicts)
 
     # ------------------------------------------------------------------ mutation-based repair check
-    def repair_check(self, tests: list[str], fixes: list[str], deadline: float = 75,
-                     baseline_only: bool = False, guards: list[str] | None = None) -> dict:
+    def repair_check(self, tests: list[str], fixes: list[str], deadline: float = 65,
+                     baseline_only: bool = False, guards: list[str] | None = None,
+                     hot: dict | None = None) -> dict:
         tag = uuid.uuid4().hex[:8]
         req, out = self.ws / f".tagent_req_{tag}.json", self.ws / f".tagent_res_{tag}.json"
         req.write_text(json.dumps({"package": self.pkg, "tests": tests, "fixes": fixes, "guards": guards or [],
+                                   "hot": hot or {},
                                    "deadline": 0 if baseline_only else deadline, "baseline_only": baseline_only}))
-        cmd = (f"PYTHONPATH={shlex.quote(str(self.student))} timeout 115 python -m tagent.repair "
+        cmd = (f"PYTHONPATH={shlex.quote(str(self.student))} timeout 112 python -m tagent.repair "
                f"{req.name} {out.name} > /dev/null 2>&1")
         self.runner.env.execute({"command": cmd}, timeout=120)
         res = {}
@@ -333,10 +335,22 @@ class Pipeline:
             return set(), {}
         ids = [f"{rel}::{t.nodeid.split('::', 1)[1]}" if "::" in t.nodeid else t.nodeid for t in cands]
         by_id = dict(zip(ids, cands))
-        with self.lock:
-            fixes = list(self.fixes)
-            guards = list(self.guards)
-        res = self.repair_check(ids, fixes, guards=guards)
+        res = {"baseline": {}, "explained": {}, "sites": {}, "notes": []}
+        for i in range(0, len(ids), 5):
+            chunk = ids[i:i + 5]
+            hot: dict[str, list[int]] = {}
+            for tid in chunk:
+                for f in by_id[tid].frames or []:
+                    path = str(f[0])
+                    if f"{self.pkg}/" in path or path.startswith(self.pkg):
+                        hot.setdefault(path[path.find(self.pkg):], []).append(int(f[1]))
+            with self.lock:
+                fixes = list(self.fixes)
+                guards = list(self.guards)
+            part = self.repair_check(chunk, fixes, guards=guards, hot=hot)
+            for key in ("baseline", "explained", "sites"):
+                res[key].update(part.get(key) or {})
+            res["notes"] += part.get("notes") or ["(no result)"]
         self.llm.note("repair", file=rel, notes=res.get("notes"), explained=res.get("explained"),
                       baseline_passing=[t for t, ok in (res.get("baseline") or {}).items() if ok])
         keep, located = set(), {}

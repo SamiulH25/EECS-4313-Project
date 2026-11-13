@@ -114,6 +114,75 @@ def risk_points(tree: ast.AST, src_lines: list[str], spans: list[tuple[int, int]
     return [t for _, t in out][:limit]
 
 
+def suspicious_lines(text: str) -> dict[int, str]:
+    """Lines whose code deviates from similar code elsewhere in the same file (belief analysis:
+    redundant code reveals the programmer's intent, and a lone deviation is a likely slip)."""
+    from .repair import _FLIP, comparison_profile  # local import keeps inventory light
+
+    out: dict[int, str] = {}
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return out
+    starts = [0]
+    for line in text.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+
+    def line_of(offset):
+        lo, hi = 0, len(starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if starts[mid] <= offset:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo + 1
+
+    profile = comparison_profile(text)
+    for me in profile:
+        votes = []
+        for c in profile:
+            if c is me:
+                continue
+            same = bool(c["left"] & me["left"]) or bool(c["right"] & me["right"])
+            crossed = bool(c["left"] & me["right"]) or bool(c["right"] & me["left"])
+            if same and not crossed:
+                votes.append(c["op"])
+            elif crossed and not same:
+                votes.append(_FLIP.get(c["op"], c["op"]))
+        if len(votes) >= 3:
+            top = max(set(votes), key=votes.count)
+            if votes.count(top) / len(votes) >= 0.6 and me["op"] is not top:
+                out[line_of(me["start"])] = "operator differs from similar comparisons elsewhere"
+    # Statements of the same shape whose numeric constants disagree (e.g. one copy of a repeated
+    # line uses 127 where the others use 128).
+    from .repair import constant_shapes, plurality
+    shapes: dict[str, list[tuple[tuple, int]]] = {}
+    for c in constant_shapes(text):
+        shapes.setdefault(c["key"], []).append((c["consts"], c["line"]))
+    for key, vals in shapes.items():
+        if len(vals) >= 3 and len({c for c, _ in vals}) > 1:
+            top = plurality([c for c, _ in vals])
+            for c, ln in vals:
+                if c != top:
+                    out[ln] = "constant differs from the same code elsewhere; check the documented value"
+    # Parameter defaults that differ between sibling functions (same parameter name).
+    defaults: dict[str, list[tuple[object, int]]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = node.args.args[-len(node.args.defaults):] if node.args.defaults else []
+            pairs = list(zip(args, node.args.defaults)) + [
+                (a, d) for a, d in zip(node.args.kwonlyargs, node.args.kw_defaults) if d is not None]
+            for a, d in pairs:
+                if isinstance(d, ast.Constant) and type(d.value) in (int, float):
+                    defaults.setdefault(a.arg, []).append((d.value, d.lineno))
+    for name, vals in defaults.items():
+        if len(vals) >= 3 and len({v for v, _ in vals}) > 1:
+            for v, ln in vals:
+                out[ln] = f"default {name}={v} differs between sibling functions; check the documented default"
+    return out
+
+
 def _exports(workspace: Path, package: str) -> set[str]:
     init = workspace / package / "__init__.py"
     names = set()
@@ -178,6 +247,7 @@ def build_units(workspace: Path, package: str) -> list[Unit]:
     for path, rel, dotted, text, tree in parsed:
         src_lines = text.splitlines()
         stem = dotted.split(".")[-1]
+        suspicious = suspicious_lines(text)
         free: list[ast.AST] = []
 
         def emit(cls_name, members_nodes, cls_node=None):
@@ -211,15 +281,36 @@ def build_units(workspace: Path, package: str) -> list[Unit]:
                 imp = (f"from {package} import {', '.join(exported)}" if exported and len(exported) == len(names)
                        else f"from {dotted} import {', '.join(names) or '...'}")
             risks = risk_points(tree, src_lines, spans)
+            sus = [f"L{ln}: SUSPICIOUS - {why}" for ln, why in sorted(suspicious.items())
+                   if any(a <= ln <= b for a, b in spans)]
+            risks = sus + risks
             u = Unit(uid=uid, module=dotted, path=str(rel), cls=cls_name,
                      members=[n.name for n in members_nodes], spans=spans,
                      source="\n".join(parts), risks=risks, import_hint=imp)
             if cls_node is not None:
-                u.outline = "\n".join(outline(cls_node))[:3500]
+                text_outline = "\n".join(outline(cls_node))[:3500]
+                own = {n.name for n in cls_node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                variants = []
+                for b in cls_node.bases:
+                    base = classes.get(ast.unparse(b).split(".")[-1])
+                    if base is not None and base is not cls_node:
+                        inherited = {n.name for n in base.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                        over = sorted(own & inherited - {"__init__", "__repr__"})
+                        if over:
+                            variants.append(f"{cls_node.name} overrides {', '.join(over[:20])} of {base.name}")
+                subs = [c.name for c in classes.values() if any(ast.unparse(b).split(".")[-1] == cls_node.name
+                                                              for b in c.bases)]
+                if subs:
+                    variants.append(f"subclasses of {cls_node.name}: {', '.join(subs)}")
+                if variants:
+                    text_outline += ("\n# Variants of the same interface (differential oracle: configure them to be "
+                                     "equivalent, e.g. identity key / huge size / frozen timer, and compare):\n# "
+                                     + "\n# ".join(variants))
+                u.outline = text_outline
             pub = sum(1 for m in u.members if not m.startswith("_") or m in ("__init__", "__getitem__", "__setitem__",
                                                                              "__delitem__", "__contains__", "__len__",
                                                                              "__iter__", "__eq__", "__lt__"))
-            u.weight = len(risks) + 0.5 * pub + (2 if (cls_name or public) in exports else 0)
+            u.weight = len(risks) + 0.5 * pub + (2 if (cls_name or public) in exports else 0) + 4 * len(sus)
             units.append(u)
 
         def chunk(nodes):

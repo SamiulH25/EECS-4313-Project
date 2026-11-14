@@ -1097,6 +1097,9 @@ def shadow_package(pkg: str, fixes: list[str]) -> str | None:
 def main():
     req = json.loads(open(sys.argv[1]).read())
     sys.setrecursionlimit(3000)
+    # _run and _eval stop a program after a few seconds with SIGALRM; without this handler the
+    # signal would kill the whole fuzzing pass instead of skipping one slow program.
+    signal.signal(signal.SIGALRM, _alarm)
     try:
         shadow_package(req["package"], req.get("fixes") or [])
     except Exception:  # noqa: BLE001 - fall back to the real code

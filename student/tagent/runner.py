@@ -138,6 +138,7 @@ class TestResult:
     frames: list = field(default_factory=list)
     crash: list | None = None
     flaky: bool = False
+    duration: float = 0.0
 
     @property
     def name(self) -> str:
@@ -212,6 +213,7 @@ class Runner:
             outcomes = {r.get(nodeid, {}).get("outcome") for r in runs}
             tr = TestResult(nodeid, rec.get("outcome", "failed"), rec.get("text", ""), rec.get("frames", []),
                             rec.get("crash"))
+            tr.duration = max(float(r.get(nodeid, {}).get("duration", 0) or 0) for r in runs)
             if len(outcomes) > 1:
                 tr.flaky = True
                 # Prefer a failure record when one run failed.

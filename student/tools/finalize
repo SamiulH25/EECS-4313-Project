@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""finalize: write the confirmed tests into tests_new/.
+
+Usage: finalize
+
+Copies every confirmed test, re-runs the suite twice and keeps only tests that still fail reliably on
+this code, at most the evaluator's test limit. Run it before you finish (it is also run automatically
+at the end)."""
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return 0
+    from tagent.session import Session
+    s = Session()
+    print(s.op_finalize())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

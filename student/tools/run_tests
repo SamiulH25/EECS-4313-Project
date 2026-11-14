@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""run_tests: run a test file you wrote and check its failing tests.
+
+Usage: run_tests _cand/test_<unit id>_<n>.py
+
+Steps: static checks (forbidden imports, syntax; broken parts are dropped), properties (every top-level
+`def prop_<rule>(r)` is run on 200 random inputs and failing inputs become test_<prop>_seed<N> tests),
+then pytest twice in different orders with coverage. Passing tests cannot reveal a bug. Tests that
+crash inside the test code are reported so you can fix them. Failing tests go to the repair check: a
+test is kept only if one small change to the library code (a comparison, constant, operator or
+argument) makes it pass without breaking any passing test, so wrong expectations are filtered out."""
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return 0
+    from tagent.session import Session
+    s = Session()
+    if not args:
+        print('Usage: run_tests _cand/test_<unit id>_<n>.py')
+        return 1
+    print(s.op_run_tests(args[0]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

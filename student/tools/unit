@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""unit: show what you need to write tests for one unit.
+
+Usage: unit <unit id> [docs|code|all|<method name>]
+
+Prints the import line, the documentation for the unit (the correct behaviour), its signatures and
+code (which may contain bugs: never take expected values from it), its risk points, the branches no
+test has reached yet and the results of your earlier tests for it. Default part: all.
+With a method name (e.g. `unit u07 count`) it prints just that method, with line numbers and the
+risk points inside it: use it instead of cat/sed to read code."""
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return 0
+    from tagent.session import Session
+    s = Session()
+    if not args:
+        print('Usage: unit <unit id> [docs|code|all|<method name>]')
+        return 1
+    print(s.op_unit(args[0], args[1] if len(args) > 1 else 'all'))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

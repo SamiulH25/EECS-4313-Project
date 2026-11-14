@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""confirm: run the repair check on failing tests that are still waiting (up to 5 per call).
+
+Usage: confirm
+
+For each failing test it searches small changes to the library code (mutations at the lines the test
+executes). The test is CONFIRMED when one change makes it pass and keeps every passing test passing;
+otherwise it is rejected as a probable wrong expectation. Run it until the queue is empty."""
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return 0
+    from tagent.session import Session
+    s = Session()
+    print(s.op_confirm())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

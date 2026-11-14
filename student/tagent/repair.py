@@ -38,6 +38,9 @@ BIN_ALTS = {ast.Add: [ast.Sub], ast.Sub: [ast.Add], ast.Mult: [ast.FloorDiv, ast
             ast.RShift: [ast.LShift], ast.BitAnd: [ast.BitOr], ast.BitOr: [ast.BitAnd], ast.Pow: [ast.Mult]}
 
 
+PAIR_MAX = 24       # pair repairs are tried only for tests that execute at most this many mutation sites
+
+
 def _offsets(text: str) -> list[int]:
     starts = [0]
     for line in text.splitlines(keepends=True):
@@ -629,7 +632,9 @@ def main():
         guard_lines: dict = {}
         guards = []
         if req.get("guards") and not req.get("baseline_only"):
-            pool = list(dict.fromkeys(req["guards"]))[-400:]
+            pool = list(dict.fromkeys(req["guards"]))
+            pool = [g for g in pool if "test_contracts_" in g][:220] + \
+                [g for g in pool if "test_contracts_" not in g][-400:]
             guards = [g for g, ok in runner.run(pool, timeout=2.0, trace_lines=guard_lines,
                                                 budget=min(25.0, max(5.0, deadline - time.time() - 30))).items() if ok]
             result["notes"].append(f"{len(guards)} guards")
@@ -704,6 +709,53 @@ def main():
                 explains[s["site"]] = passed
                 result["sites"][s["site"]] = {k: s[k] for k in ("file", "line", "kind", "orig", "repl")}
                 save()
+        apply_sites(tmp, base_texts, [])
+        # Two bugs on one path: a failing test that executes only a few mutation sites and that no single
+        # repair explains may need two small repairs at once (each bug is still one small slip).
+        pair_explains: dict[str, tuple[dict, dict]] = {}
+        done = {t for v in explains.values() for t in v}
+        for t in [t for t in failing if t not in done]:
+            if time.time() > deadline:
+                break
+            mine = [s for s in sites if any(ln in lines.get(t, {}).get(s["file"], ())
+                                             for ln in range(s["line"], s["line"] + 3))]
+            result["notes"].append(f"pair search: {len(mine)} sites")
+            if not 2 <= len(mine) <= PAIR_MAX:
+                continue
+            found = None
+            for i in range(len(mine)):
+                for j in range(i + 1, len(mine)):
+                    a, b = mine[i], mine[j]
+                    if a["file"] == b["file"] and not (a["end"] <= b["start"] or b["end"] <= a["start"]):
+                        continue
+                    apply_sites(tmp, base_texts, [a, b])
+                    profile("screen")
+                    ok = runner.run([t], timeout=2.0).get(t)
+                    profile("tagent")
+                    if ok and runner.run([t], timeout=4.0).get(t):
+                        near = [g for g in guards if any(ln in guard_lines.get(g, {}).get(x["file"], ())
+                                                         for x in (a, b) for ln in range(x["line"], x["line"] + 3))][:80]
+                        if not near or all(runner.run(near, timeout=3.0).values()):
+                            found = (a, b)
+                            break
+                if found or time.time() > deadline:
+                    break
+            apply_sites(tmp, base_texts, [])
+            if found:
+                pair_explains[t] = found
+            result["notes"].append(f"pair for {t.split('::')[-1]}: {bool(found)}")
+        for t, (a, b) in pair_explains.items():
+            if time.time() > deadline + 25:
+                break
+            apply_sites(tmp, originals, fixes + [parse_site(a["site"]), parse_site(b["site"])])
+            ok = suite_passes(tmp, suite, timeout=40)
+            result["notes"].append(f"pair suite ok: {ok}")
+            if ok:
+                result["explained"][t] = [a["site"], b["site"]]
+                result.setdefault("pairs", {})[t] = [a["site"], b["site"]]
+                for x in (a, b):
+                    result["sites"][x["site"]] = {k: x[k] for k in ("file", "line", "kind", "orig", "repl")}
+            save()
         apply_sites(tmp, base_texts, [])
         # The existing suite must still pass with the repair: check the strongest repairs first.
         order = sorted(explains, key=lambda k: -len(explains[k]))

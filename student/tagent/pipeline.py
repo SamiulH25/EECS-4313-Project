@@ -44,7 +44,8 @@ USE_REPAIR_FILTER = True    # keep a failing test only if a single small code re
 USE_CONTRACTS = True        # model-free contract fuzzing (reference models, observer consistency, ddmin)
 CONTRACT_SEEDS = (1, 2, 3, 4)  # one fuzzing pass (about 90 s) per seed, each on top of the repairs found so far
 CONTRACT_MAX_VERIFY = 15
-CONTRACT_LONG = 2          # long regression sequences per driven object, written after the shrunk passes    # failing contract tests per pass sent to the repair check (spread over failure kinds)
+CONTRACT_GUARDS = 6        # short passing sequences per driven object used only as repair guards
+CONTRACT_LONG = 4          # long regression sequences per driven object, written after the shrunk passes    # failing contract tests per pass sent to the repair check (spread over failure kinds)
 USE_PLANNER = True          # the model plans each round from the tools' report
 USE_PROPS = True            # the model may state documented rules as properties; a tool explores inputs
 PROP_SEEDS = 200            # random inputs per property
@@ -156,6 +157,9 @@ def is_boundary_flip(info: dict) -> bool:
         return False
     norm = lambda t: re.sub(r"\s+|[()]", "", re.sub(r"<=|>=|==|!=|<|>", "?", t))  # noqa: E731
     return norm(orig) == norm(repl)
+
+
+SLOW_TEST = 1.5          # seconds; slower tests are not submitted (see assemble)
 
 
 class Pipeline:
@@ -278,6 +282,42 @@ class Pipeline:
                 with self.lock:
                     self.sources[rel] = src
                     self.kept[rel] = keep
+                    # reference-checked tests that pass once the accepted repairs are applied guard later
+                    # repairs (the repair tool re-runs guards with those repairs and keeps the passing ones)
+                    for t in tests:
+                        if t.func in keep and "::" in t.nodeid:
+                            self.guards.append(f"{rel}::{t.nodeid.split('::', 1)[1]}")
+
+    def contract_guards(self):
+        """Short reference-checked sequences that pass on the current code: never submitted, only used as
+        guards so a repair that 'explains' a wrong model test must not break the reference model's behaviour."""
+        tag = uuid.uuid4().hex[:8]
+        req, out = self.ws / f".tagent_creq_{tag}.json", self.ws / f".tagent_cres_{tag}.json"
+        with self.lock:
+            fixes = list(self.fixes)
+        req.write_text(json.dumps({"package": self.pkg, "deadline": 40, "seed": 77, "fixes": fixes,
+                                   "long": CONTRACT_GUARDS, "span": 2}))
+        cmd = (f"PYTHONPATH={shlex.quote(str(self.student))} timeout 60 python -m tagent.contracts "
+               f"{req.name} {out.name} > /dev/null 2>&1")
+        self.runner.env.execute({"command": cmd}, timeout=70)
+        res = {}
+        if out.exists():
+            try:
+                res = json.loads(out.read_text())
+            except json.JSONDecodeError:
+                res = {}
+        req.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
+        src = res.get("source") or ""
+        if not src or static_problem(src):
+            return
+        rel = "_cand/test_contracts_guard.py"
+        (self.ws / rel).write_text(src)
+        tests, _, _ = self.runner.results([rel], repeats=1)
+        ids = [f"{rel}::{t.nodeid.split('::', 1)[1]}" for t in tests if "::" in t.nodeid]
+        self.llm.note("contract_guards", count=len(ids), passing=sum(t.outcome == "passed" for t in tests))
+        with self.lock:
+            self.guards = ids + self.guards
 
     # ------------------------------------------------------------------ phase 3: model-written tests
     def llm_phase(self):
@@ -663,6 +703,7 @@ class Pipeline:
             for key in ("errors", "guard_errors", "guard_rejected", "suite_ok"):
                 res.setdefault(key, {}).update(part.get(key) or {})
             res.setdefault("sibling_rejected", []).extend(part.get("sibling_rejected") or [])
+            res.setdefault("pairs", {}).update(part.get("pairs") or {})
         self.llm.note("repair", file=rel, notes=res.get("notes"), explained=res.get("explained"),
                       baseline_passing=[t for t, ok in (res.get("baseline") or {}).items() if ok],
                       errors=res.get("errors"), guard_errors=res.get("guard_errors"),
@@ -714,6 +755,11 @@ class Pipeline:
                 located[t.func] = f"{info.get('file', '?')} line {info.get('line', '?')}" if info else site
                 if site != "(earlier repair)" and len(sites) == 1 and not self._overlaps(site):
                     self.fixes.append(site)
+                elif tid in (res.get("pairs") or {}):
+                    # two bugs on one path, repaired together
+                    for x in res["pairs"][tid]:
+                        if not self._overlaps(x):
+                            self.fixes.append(x)
         return keep, located
 
     def boundary_vote(self, u, info: dict) -> bool:
@@ -847,6 +893,9 @@ class Pipeline:
 
     # ------------------------------------------------------------------ final suite
     def assemble(self):
+        """Write tests_new/ from the confirmed tests. A test that runs longer than SLOW_TEST seconds is
+        left out: under the evaluator's load it can hit the time limit on the correct code (a false
+        alarm), and its "detections" there are timeouts rather than real failures."""
         out_dir = self.ws / "tests_new"
         out_dir.mkdir(exist_ok=True)
         for p in out_dir.rglob("*.py"):
@@ -872,7 +921,7 @@ class Pipeline:
         still = {}
         for t in tests:
             file = t.nodeid.split("::")[0].split("/")[-1]
-            if t.outcome == "failed" and not t.flaky:
+            if t.outcome == "failed" and not t.flaky and t.duration < SLOW_TEST:
                 still.setdefault(file, set()).add(t.func)
         bad_files = {c.split("::")[0].split("/")[-1] for c in coll}
         total = 0
@@ -898,6 +947,11 @@ class Pipeline:
             try:
                 if USE_CONTRACTS:
                     self.contract_phase()
+            except Exception as error:  # noqa: BLE001
+                self.llm.note("contract-error", error=f"{error}\n{traceback.format_exc()[-1500:]}")
+            try:
+                if USE_CONTRACTS and CONTRACT_GUARDS:
+                    self.contract_guards()
             except Exception as error:  # noqa: BLE001
                 self.llm.note("contract-error", error=f"{error}\n{traceback.format_exc()[-1500:]}")
             try:

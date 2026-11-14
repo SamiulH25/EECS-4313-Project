@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""fuzz: model-based random testing of the package's classes and caching functions (about 60 s).
+
+Usage: fuzz          one fuzzing pass (there are 4, each with a new seed)
+       fuzz --long   once, after the passes: long operation sequences that pass once the confirmed
+                     repairs are applied (they guard many paths at once)
+
+The tool finds sorted containers, mappings, sets, caches and memoizing decorators, drives them with
+random operation sequences and compares every result with a small reference model (list, dict, set,
+bisect, a brute-force cache). Failing programs are shrunk (delta debugging) and queued for the repair
+check. Each pass builds on the repairs confirmed so far, so later passes reach bugs hidden behind
+earlier ones."""
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__.strip())
+        return 0
+    from tagent.session import Session
+    s = Session()
+    print(s.op_fuzz(long='--long' in args))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -594,6 +594,13 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
             "islice", "irange_none", "iadd", "add_op", "mul", "cmp", "index_range"]
     if K == "_half":
         opts = ["add", "add", "add", "discard", "discard", "remove", "update", "iadd", "clear"]
+    if r.random() < BIG_P:
+        # Containers often switch to a different internal layout above some size: grow past a few
+        # thousand elements, then sweep operations over every value so each internal boundary is hit.
+        lo, n = r.randrange(0, 50), r.randrange(1500, 2700)
+        bulk = (f"_same(lambda: s.update(range({lo}, {lo + n})), lambda: _ins(ref, {K}, *range({lo}, {lo + n})), "
+                f"'update(range({lo}, {lo + n}))')")
+        return bulk + "\n" + _sweep(t, r, lo, lo + n) + f"\n_check_seq(s, ref, {K}, range(8))"
     c = r.choice(opts)
     code = {
         "add": f"_same(lambda: s.add({x}), lambda: _ins(ref, {K}, {x}), 'add({x})')",
@@ -624,6 +631,53 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
     if t.key == "_neg" and c in ("add_op", "mul"):
         code = "pass"
     return code + f"\n_check_seq(s, ref, {K}, range(8))"
+
+
+BIG_P = 0.08
+
+
+def _sweep(t: Target, r: random.Random, lo: int, hi: int) -> str:
+    """One operation applied across the whole value range of a large sorted sequence."""
+    K = t.key
+    step = r.choice([1, 1, 3, 7])
+    kind = r.choice(["discard", "remove", "index", "irange", "slice", "count"])
+    vals = f"range({lo + r.randrange(step)}, {hi + 2}, {step})"
+    if kind == "discard":
+        return (f"for _v in {vals}:\n    s.discard(_v)\n    _disc(ref, _v)\n"
+                f"assert sorted(s) == sorted(ref) and len(s) == len(ref), f'after discard sweep: len {{len(s)}} != {{len(ref)}}'")
+    if kind == "remove":
+        return (f"for _v in {vals}:\n    _same(lambda: s.remove(_v), lambda: _rem(ref, _v), f'remove({{_v}})')\n"
+                f"assert sorted(s) == sorted(ref) and len(s) == len(ref), f'after remove sweep: len {{len(s)}} != {{len(ref)}}'")
+    if kind == "count":
+        return (f"for _v in {vals}:\n    if hasattr(s, 'count'):\n"
+                f"        assert s.count(_v) == ref.count(_v), f'count({{_v}})'\n"
+                f"    assert (_v in s) == (_v in ref), f'{{_v}} in s'")
+    if kind == "index" and K in ("None", "_ident"):
+        a, b = r.choice([(None, None), (-r.randrange(1, 900), None), (r.randrange(0, 900), -r.randrange(1, 900)),
+                         (-r.randrange(900, 3000), -r.randrange(1, 50))])
+        return (f"for _v in {vals}:\n    if hasattr(s, 'index'):\n"
+                f"        _same(lambda: s.index(_v, {a}, {b}), lambda: ref.index(_v, {a}, {b}), f'index({{_v}}, {a}, {b})')")
+    if kind == "irange":
+        w = r.randrange(1, 1200)
+        a = lo + r.randrange(0, hi - lo)
+        lines = [f"for _a in range({a % 997}, {hi + 2}, 997):"]
+        if K in ("None", "_ident"):
+            lines += [f"    if hasattr(s, 'irange'):",
+                      f"        _same(lambda: list(s.irange(_a, _a + {w})), lambda: [v for v in ref if _a <= v <= _a + {w}], f'irange({{_a}}, {{_a + {w}}})')",
+                      f"        _same(lambda: list(s.irange(_a, _a + {w}, (False, False))), lambda: [v for v in ref if _a < v < _a + {w}], f'irange({{_a}}, {{_a + {w}}}, (False, False))')",
+                      f"        _same(lambda: list(s.irange(_a, _a + {w}, reverse=True)), lambda: [v for v in ref if _a <= v <= _a + {w}][::-1], f'irange({{_a}}, {{_a + {w}}}, reverse=True)')"]
+        else:
+            lines += [f"    if hasattr(s, 'irange_key'):",
+                      f"        _same(lambda: sorted(s.irange_key(_a // 2, _a // 2 + {w})), lambda: sorted(v for v in ref if _a // 2 <= {K}(v) <= _a // 2 + {w}), f'irange_key({{_a // 2}}, {{_a // 2 + {w}}})')",
+                      f"        _same(lambda: sorted(s.irange_key(-_a, -_a + {w})), lambda: sorted(v for v in ref if -_a <= {K}(v) <= -_a + {w}), f'irange_key({{-_a}}, {{-_a + {w}}})')",
+                      f"        _same(lambda: sorted(s.irange_key(_a, _a + {w}, (False, False))), lambda: sorted(v for v in ref if _a < {K}(v) < _a + {w}), f'irange_key({{_a}}, {{_a + {w}}}, (False, False))')"]
+        return "\n".join(lines)
+    # slices and negative indexes across the whole length
+    K = "(lambda v: v)" if K in ("None", "_ident") else K
+    return (f"_n = len(ref)\nfor _i in range(-_n, _n, {r.choice([1, 13, 97])}):\n"
+            f"    assert {K}(s[_i]) == {K}(sorted(ref, key={K})[_i]), f's[{{_i}}]'\n"
+            f"for _a, _b in ((5, -5), (-1500, None), (999, 2001), (-2001, -999)):\n"
+            f"    assert [{K}(v) for v in s[_a:_b]] == [{K}(v) for v in sorted(ref, key={K})[_a:_b]], f's[{{_a}}:{{_b}}]'")
 
 
 def ops_set(t: Target, r: random.Random) -> str:
@@ -859,8 +913,9 @@ def _signature(fail) -> str:
     return f"{typ}:{label[:60]}"
 
 
-def ddmin(head: str, chunks: list[str], sig: str, head_chunks: int = 0) -> list[str]:
-    """Delta debugging over the op chunks: the smallest list that still fails with the same signature."""
+def ddmin(head: str, chunks: list[str], sig: str, head_chunks: int = 0, until: float | None = None) -> list[str]:
+    """Delta debugging over the op chunks: the smallest list that still fails with the same signature
+    (or the smallest found before `until`)."""
     fixed, items = chunks[:head_chunks], chunks[head_chunks:]
 
     def fails(sub):
@@ -868,7 +923,7 @@ def ddmin(head: str, chunks: list[str], sig: str, head_chunks: int = 0) -> list[
         return res is not None and _signature(res) == sig
 
     n = 2
-    while len(items) >= 2:
+    while len(items) >= 2 and (until is None or time.time() < until):
         size = max(1, len(items) // n)
         parts = [items[i:i + size] for i in range(0, len(items), size)]
         reduced = False
@@ -884,7 +939,7 @@ def ddmin(head: str, chunks: list[str], sig: str, head_chunks: int = 0) -> list[
     return fixed + items
 
 
-def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int = 60, long: int = 0) -> dict:
+def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int = 60, long: int = 0, span: int = 8) -> dict:
     r = random.Random(seed)
     stdlib = set(dir(functools))
     found = []
@@ -928,11 +983,11 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
         # Long regression sequences: programs that pass on the code with the repairs accepted so far.
         # Each drives many paths, so it guards against more single defects than a shrunk failure does.
         for label, head, make, nfixed in jobs:
-            if nfixed or time.time() > end:
+            if (nfixed and span >= 8) or time.time() > end:
                 continue
             for _ in range(long):
                 for _try_ in range(5):
-                    chunks = [c for _k in range(5) for c in make(r)]
+                    chunks = make(r) if nfixed else [c for _k in range(span) for c in make(r)]
                     stats["programs"] += 1
                     if _run(head + "\n".join(chunks)) is None and _run(head + "\n".join(chunks)) is None:
                         found.append({"label": label, "sig": "long", "body": "\n".join(chunks), "head": head})
@@ -953,7 +1008,7 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
                 sig = _signature(res)
                 if sigs.get((label, sig, "*"), 0) >= 4 * per_sig:
                     continue
-                small = ddmin(head, chunks, sig, nfixed)
+                small = ddmin(head, chunks, sig, nfixed, until=end + 5)
                 code = head + "\n".join(small)
                 # must fail the same way every time
                 if any(_signature(_run(code) or ("pass", "")) != sig for _ in range(3)):
@@ -1048,7 +1103,7 @@ def main():
         pass
     res = fuzz(req["package"], float(req.get("deadline", 60)), int(req.get("seed", 1)),
                per_sig=int(req.get("per_sig", 2)), max_tests=int(req.get("max_tests", 60)),
-               long=int(req.get("long", 0)))
+               long=int(req.get("long", 0)), span=int(req.get("span", 8)))
     res["source"] = render(res["tests"]) if res["tests"] else ""
     with open(sys.argv[2], "w") as fh:
         json.dump({"source": res["source"], "stats": res["stats"],

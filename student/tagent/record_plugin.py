@@ -53,6 +53,7 @@ def pytest_runtest_logreport(report):
     if report.when != "call" and not report.failed:
         return
     rec = {"outcome": report.outcome, "when": report.when}
+    rec["duration"] = round(getattr(report, "duration", 0.0) or 0.0, 3)
     if report.failed:
         rec["text"] = report.longreprtext[-4000:]
         frames = []

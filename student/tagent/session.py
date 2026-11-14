@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 from . import doctests, inventory
 from .pipeline import (CONTRACT_GUARDS, CONTRACT_LONG, CONTRACT_MAX_VERIFY, CONTRACT_SEEDS, PROP_SEEDS,
-                       Pipeline, prune, reads_private)
+                       USE_CONTRACTS, USE_DOCTESTS, Pipeline, prune, reads_private)
 from .runner import CONFTEST, TestResult, salvage, static_problem, triage_auto
 
 STATE = Path(".tagent") / "state.json"
@@ -282,6 +282,8 @@ class Session(Pipeline):
 
     # ------------------------------------------------------------------ tool operations
     def op_doc_examples(self) -> str:
+        if not USE_DOCTESTS:                     # ablation: documentation examples switched off
+            return "This tool is switched off in this configuration. Run `fuzz` next."
         if self.flags.get("docs_done"):
             return "Documentation examples were already mined. " + self.queue_line()
         self.flags["docs_done"] = True
@@ -308,6 +310,8 @@ class Session(Pipeline):
         return "\n".join(report)
 
     def op_fuzz(self, seed: int | None = None, long: bool = False) -> str:
+        if not USE_CONTRACTS:                    # ablation: model-based fuzzing switched off
+            return "All fuzzing passes are done (the fuzzer is switched off in this configuration). Now write your own tests."
         done = self.flags.setdefault("fuzz_seeds", [])
         if long:
             if self.flags.get("long_done"):

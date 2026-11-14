@@ -562,6 +562,9 @@ def _terminate(signum, frame):
 
 
 def main():
+    # Mutants are written in quick succession and often have the same size: a cached .pyc (keyed by
+    # mtime in seconds and size) would then run the previous mutant's code. Never cache bytecode here.
+    sys.dont_write_bytecode = True
     signal.signal(signal.SIGTERM, _terminate)
     req = json.loads(Path(sys.argv[1]).read_text())
     out_path = Path(sys.argv[2])

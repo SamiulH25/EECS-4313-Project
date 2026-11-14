@@ -409,9 +409,18 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
+class _Sink:
+    def write(self, text):
+        return len(text)
+
+    def flush(self):
+        pass
+
+
 def _run(code: str, seconds: float = 2.0):
     """Exec test code; returns None on success or (exception type, message) on failure."""
     ns = dict(_H)
+    out, sys.stdout = sys.stdout, _Sink()
     signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
         exec(compile(code, "<contract>", "exec"), ns)
@@ -431,6 +440,7 @@ def _run(code: str, seconds: float = 2.0):
         return (type(e).__name__, msg)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
+        sys.stdout = out
 
 
 def _eval(code: str, ns: dict):
@@ -643,7 +653,7 @@ def ops_map_cons(t: Target, r: random.Random) -> str:
     if t.extra.get("clock"):
         opts += ["tick", "tick", "tick"]
     if t.extra.get("methods"):
-        opts += ["meth"]
+        opts += ["meth"] * (3 if getattr(r, "crash", False) else 1)
     if r.random() < 0.05:
         opts += ["clear"]
     c = r.choice(opts)
@@ -664,7 +674,9 @@ def ops_map_cons(t: Target, r: random.Random) -> str:
     if c == "tick":
         return f"clock.t += {r.choice([1, 1, 4, 5, 10, 10])}"
     name = r.choice(t.extra["methods"])
-    return f"_no_crash(lambda: m.{name}(), '{name}()')\n_cons_map(m, range(8))"
+    if getattr(r, "crash", False):
+        return f"_no_crash(lambda: m.{name}(), '{name}()')\n_cons_map(m, range(8))"
+    return f"_outcome(lambda: m.{name}())\n_cons_map(m, range(8))"
 
 
 def ops_map_policy(t: Target, r: random.Random) -> str:
@@ -751,6 +763,16 @@ def ops_self(t: Target, r: random.Random, positional: bool = False) -> str:
     weights = [3 if "update" in op else 1 for op in ops]
     op = r.choices(ops, weights)[0]
     return f"_outcome(lambda: {op})\n_self_check({o})"
+
+
+def crash_program(t: Target, gen, r: random.Random) -> list[str]:
+    """Programs whose zero-argument method calls must not crash with an internal error; a separate job,
+    so such a crash does not stop the reference-model programs before they reach other bugs."""
+    r.crash = True
+    try:
+        return _program(t, gen, r)
+    finally:
+        r.crash = False
 
 
 def self_program(t: Target, r: random.Random) -> list[str]:
@@ -1233,6 +1255,7 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
     t0 = time.time()
     selfs = self_check_names()
     self_done = set()
+    crash_done = set()
     jobs = []   # (label, head, chunk generator)
     for path, obj in objs:
         if time.time() - t0 > deadline * 0.3:
@@ -1254,6 +1277,9 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
                         shead = head + f"_SELF[:] = {ok!r}\n"
                         jobs.append((f"self-check:{t.name()}", shead, (lambda rr, t=t: self_program(t, rr)), 0))
                 jobs.append((f"{t.kind}:{t.name()}", head, (lambda rr, t=t, gen=gen: _program(t, gen, rr)), 0))
+                if t.extra.get("methods") and t.name() not in crash_done:
+                    crash_done.add(t.name())
+                    jobs.append((f"no-crash:{t.name()}", head, (lambda rr, t=t, gen=gen: crash_program(t, gen, rr)), 0))
         elif inspect.isfunction(obj):
             forms = _memo_forms(path, obj)
             std = path.rsplit(".", 1)[-1] in stdlib
@@ -1295,7 +1321,7 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
         for label, head, make, nfixed in list(jobs):
             if time.time() > end or len(found) >= max_tests:
                 break
-            for _ in range(10):
+            for _ in range(3 if label.startswith(("self-check:", "no-crash:")) else 10):
                 chunks = make(r)
                 stats["programs"] += 1
                 res = _run(head + "\n".join(chunks))

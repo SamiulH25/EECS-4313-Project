@@ -1,0 +1,10 @@
+cachetools: final-1 20, no-filter-2 15, both 15
+  only final-1: __init__-555-9156bb1d
+  only final-1: __init__-574-2c9defcb
+  only final-1: __init__-594-69b2d30b
+  only final-1: __init__-670-78a2b942
+  only final-1: __init__-848-afcec03f
+sortedcontainers: final-1 18, no-filter-2 16, both 16
+  only final-1: sortedlist-1415-f4e70772
+  only final-1: sortedlist-1422-e3c20c9c
+Total: 7 bugs only final-1 found, 0 only no-filter-2 found.

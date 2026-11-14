@@ -1,0 +1,34 @@
+cachetools: final-1 20, no-contracts-2 0, both 0
+  only final-1: __init__-181-efd2101d
+  only final-1: __init__-416-26ae3e21
+  only final-1: __init__-441-60f9fa4c
+  only final-1: __init__-546-1f452b90
+  only final-1: __init__-555-9156bb1d
+  only final-1: __init__-574-2c9defcb
+  only final-1: __init__-581-4381440f
+  only final-1: __init__-594-69b2d30b
+  only final-1: __init__-664-bb4d8d66
+  only final-1: __init__-670-78a2b942
+  only final-1: __init__-675-f0be1827
+  only final-1: __init__-686-c06d53e8
+  only final-1: __init__-823-caf42b63
+  only final-1: __init__-848-afcec03f
+  only final-1: func-106-548ffabe
+  only final-1: func-119-5ef15507
+  only final-1: func-47-44b07a8a
+  only final-1: func-61-577d5c5d
+  only final-1: func-75-4bdd90c1
+  only final-1: func-92-d8aaf991
+sortedcontainers: final-1 18, no-contracts-2 7, both 7
+  only final-1: sortedlist-1187-1e9807de
+  only final-1: sortedlist-1415-f4e70772
+  only final-1: sortedlist-1422-e3c20c9c
+  only final-1: sortedlist-1943-281a9af4
+  only final-1: sortedlist-1946-a9b457f5
+  only final-1: sortedlist-1992-14ae0870
+  only final-1: sortedlist-1994-1dd91f87
+  only final-1: sortedlist-2047-6a756dd1
+  only final-1: sortedlist-2226-a8ee6781
+  only final-1: sortedlist-2472-62109d7a
+  only final-1: sortedset-400-0ae45178
+Total: 31 bugs only final-1 found, 0 only no-contracts-2 found.

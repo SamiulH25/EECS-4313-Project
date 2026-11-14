@@ -57,7 +57,8 @@ Record runs on the course settings; each ablation switches one technique off in 
 (`scripts/make_variant.sh`) and was run twice. The `compare` outputs are saved in `evidence/`.
 
 **Model-based fuzzing.** `python -m testagent.compare --run final-1 --against no-contracts-1` reports
-31 bugs that only `final-1` found and 0 that only `no-contracts-1` found. Without the fuzzer the model
+31 bugs that only `final-1` found and 0 that only `no-contracts-1` found (the same against
+`no-contracts-2`). Without the fuzzer the model
 alone found 7/40 (0 on cachetools); with it, 38/40. Examples:
 - `func-47`/`func-61` (memoiser cache-info counters), found by comparing `cached` with
   `functools.lru_cache`.
@@ -68,9 +69,9 @@ alone found 7/40 (0 on cachetools); with it, 38/40. Examples:
 - `func-75`/`func-92` (`cachedmethod` with a lock, `cache_clear`), found by the method-memoiser model.
 
 **Mutation-based repair check.** Without it (`no-filter-1`, `no-filter-2`) every failing test is kept:
-31/40 and NF2_BUGS/40 bugs but 30 and NF2_FA false alarms (scores 16.0 and NF2_SCORE), against 38/40 with 0 false
+31/40 bugs in both runs but 30 and 29 false alarms (scores 16.0 and 16.5), against 38/40 with 0 false
 alarms. `compare --run final-1 --against no-filter-1` shows 7 bugs only `final-1` found
-(`__init__-555`, `-574`, `-594`, `-670`, `-848`, `sortedlist-1415`, `-1422`) and 0 the other way round.
+(`__init__-555`, `-574`, `-594`, `-670`, `-848`, `sortedlist-1415`, `-1422`) and 0 the other way round (the same 7 against `no-filter-2`).
 The filter costs no recall, and the repairs it accepts let later fuzz passes look past bugs already
 found.
 
@@ -88,8 +89,8 @@ Course settings (`settings.course.yaml`), both dev projects (20 bugs each).
 | starter | 0 | 0 | 0/40 | 4 | −2.0 | — |
 | **final-1** | 20 | 18 | 38/40 | 0 | **38.0** | ~393k |
 | **final-2** | 19 | 18 | 37/40 | 0 | **37.0** | ~390k |
-| no-contracts-1 / -2 | 0 / NC2_C | 7 / NC2_S | 7 / NC2_BUGS | 0 / NC2_FA | 7.0 / NC2_SCORE | |
-| no-filter-1 / -2 | 15 / NF2_C | 16 / NF2_S | 31 / NF2_BUGS | 30 / NF2_FA | 16.0 / NF2_SCORE | |
+| no-contracts-1 / -2 | 0 / 0 | 7 / 7 | 7 / 7 | 0 / 0 | 7.0 / 7.0 | |
+| no-filter-1 / -2 | 15 / 15 | 16 / 16 | 31 / 31 | 30 / 29 | 16.0 / 16.5 | |
 
 The submitted run is `final-1`. Its two missed bugs are both in the private `SortedList._check`
 consistency check (see Q5).
@@ -158,7 +159,7 @@ told to move on after a unit has a confirmed bug or two files that found nothing
 - At most 2 tests per repaired location.
 
 False alarms went from 140 (LLM judge) to 0 in every run of the final agent; without the repair check
-the same agent keeps 22–66 (section 4).
+the same agent keeps 29–30 (section 4).
 
 **4. Generalisation.** Nothing refers to a project, file or bug. Every rule is a general property of
 code: a single-site injected bug, internal consistency, documented numbers, documented examples. Rules

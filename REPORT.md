@@ -54,25 +54,30 @@ part.
 ## 4. Evidence that a technique finds new bugs
 
 Record runs on the course settings; each ablation switches one technique off in the agent's tools
-(`scripts/make_variant.sh`) and was run twice.
+(`scripts/make_variant.sh`) and was run twice. The `compare` outputs are saved in `evidence/`.
 
 **Model-based fuzzing.** `python -m testagent.compare --run final-1 --against no-contracts-1` reports
-25 bugs that only `final-1` found and 0 that only `no-contracts-1` found (the same holds against
-`no-contracts-2`). Without the fuzzer the model alone found 7/40 (0 on cachetools); with it, 32/40.
-Examples: `func-47`/`func-61` (memoiser cache-info counters, found by comparing `cached` with
-`functools.lru_cache`) and `sortedlist-1943`/`-1994` (`irange`/`islice` bounds, found only by bulk inserts
-past the internal block size followed by range sweeps).
+31 bugs that only `final-1` found and 0 that only `no-contracts-1` found. Without the fuzzer the model
+alone found 7/40 (0 on cachetools); with it, 38/40. Examples:
+- `func-47`/`func-61` (memoiser cache-info counters), found by comparing `cached` with
+  `functools.lru_cache`.
+- `sortedlist-1943`/`-1994` (`irange`/`islice` bounds), found only by bulk inserts past the internal
+  block size followed by range sweeps.
+- `__init__-555`/`-574` (eviction order of LFU/LRU caches), found by the eviction-policy reference
+  model that tracks use counts and recency.
+- `func-75`/`func-92` (`cachedmethod` with a lock, `cache_clear`), found by the method-memoiser model.
 
 **Mutation-based repair check.** Without it (`no-filter-1`, `no-filter-2`) every failing test is kept:
-29/40 and 30/40 bugs but 66 and 22 false alarms (scores −4.0 and 19.0), against 32/40 with 0 false
-alarms. `compare --run final-1 --against no-filter-1` shows 3 bugs only `final-1` found
-(`__init__-594`, `__init__-670`, `sortedlist-1994`) and 0 the other way round: the filter costs no
-recall, and the confirmed repairs it accepts let later fuzz passes look past bugs already found.
+31/40 and NF2_BUGS/40 bugs but 30 and NF2_FA false alarms (scores 16.0 and NF2_SCORE), against 38/40 with 0 false
+alarms. `compare --run final-1 --against no-filter-1` shows 7 bugs only `final-1` found
+(`__init__-555`, `-574`, `-594`, `-670`, `-848`, `sortedlist-1415`, `-1422`) and 0 the other way round.
+The filter costs no recall, and the repairs it accepts let later fuzz passes look past bugs already
+found.
 
 **The model's own tests.** Per-file attribution of `final-1` (dev script `scripts/attribute.py`) shows
-the TLRU expiry bug `__init__-594` was found only by a model-written test
-(`test_u09_tlrucache_expire.py`), and the model's `prop_`/example files also re-found 9 other bugs.
-Doctest mining alone found `sorteddict-447`, `sorteddict-483` and `sortedlist-411`.
+the TLRU expiry bug `__init__-594` was found only by a model-written test (`test_u09_tlrucache_1.py`).
+The model's other files (`test_u03_…`, `test_u10_…`) re-found `__init__-181` and `-686`. Doctest
+mining alone found `sorteddict-447` and `sorteddict-483`.
 
 ## 5. Results on the development projects
 
@@ -81,12 +86,13 @@ Course settings (`settings.course.yaml`), both dev projects (20 bugs each).
 | Run | cachetools | sortedcontainers | Total | False alarms | Score | Tokens per project |
 |---|---|---|---|---|---|---|
 | starter | 0 | 0 | 0/40 | 4 | −2.0 | — |
-| **final-1** | 16 | 16 | 32/40 | 0 | **32.0** | ~391k |
-| **final-2** | 15 | 16 | 31/40 | 0 | **31.0** | ~391k |
-| no-contracts-1 / -2 | 0 / 0 | 7 / 7 | 7/40 | 0 | 7.0 / 7.0 | |
-| no-filter-1 / -2 | 14 / 15 | 15 / 15 | 29 / 30 | 66 / 22 | −4.0 / 19.0 | |
+| **final-1** | 20 | 18 | 38/40 | 0 | **38.0** | ~393k |
+| **final-2** | 19 | 18 | 37/40 | 0 | **37.0** | ~390k |
+| no-contracts-1 / -2 | 0 / NC2_C | 7 / NC2_S | 7 / NC2_BUGS | 0 / NC2_FA | 7.0 / NC2_SCORE | |
+| no-filter-1 / -2 | 15 / NF2_C | 16 / NF2_S | 31 / NF2_BUGS | 30 / NF2_FA | 16.0 / NF2_SCORE | |
 
-The submitted run is `final-1`.
+The submitted run is `final-1`. Its two missed bugs are both in the private `SortedList._check`
+consistency check (see Q5).
 
 ## 6. What you tried
 
@@ -120,7 +126,12 @@ that was checked while it was slow. Its honest score was about 27–28. We now d
 | Repair check reused stale `.pyc` for same-size mutants; fixed, and pair repairs for two bugs on one path | 28/40 | 0 | yes |
 | Re-check rejected tests after new repairs are accepted | 30/40 | 0 | yes |
 | Fuzzer: bulk inserts past block size + range sweeps; time-bounded shrinking | 32/40 | 0 | yes |
-| Fuzzer: install the timeout handler (one slow program had killed fuzz passes 3+) | 32/40 | 0 | yes (final) |
+| Fuzzer: install the timeout handler (one slow program had killed fuzz passes 3+) | 32/40 | 0 | yes |
+| Fuzzer: eviction-policy model (LFU/LRU/FIFO from the class docstring), zero-lifetime TLRU items, `cachedmethod` model with `cache_clear` and lock checks, focused programs that hammer one operation, fix of a reference-call error in the `index` sweep | 38/40 | 0 | yes (final) |
+
+Before the last change we ran the tools alone without the model (`scripts/tools_only.py`, a dev
+script) to see which bugs no tool could reach (33.5 and 35.0); the new oracles were aimed at those
+gaps, not at specific bug lines, and were checked on the correct code first for false alarms.
 
 ## 7. Questions
 
@@ -157,12 +168,10 @@ dev sets but judged changes by false alarms and by whether real detectors were k
 dev-only oracle script (`scripts/cand_oracle.py`, not part of the agent) reports this; we did not use
 the bug list to steer generation.
 
-**5. Bugs we still miss** (8 in `final-1`).
-- *`SortedList.index` start/stop adjustment `+=` → `-=` (2 bugs) and `SortedList._check` (2 bugs).*
-  `index` with negative `start`/`stop` is fuzzed, but these lines are only reached with offsets that
-  the shrinker removes, and `_check` is a private consistency check no public behaviour depends on.
-- *`cachedmethod` `clear` `is not` → `is` (2 bugs).* The docs barely describe `cache_clear` on
-  methods, so neither the fuzzer nor the model has an oracle there.
-- *TLRU `__setitem__` boundary `<` → `<=` and `LFUCache.__getitem__` `-=` → `+=`.* The model rarely
-  writes the two-observer test at the expiry boundary; the LFU counter bug was found by the
-  unfiltered run once, so it is reachable, but our filtered runs did not keep such a test.
+**5. Bugs we still miss** (2 in `final-1`, 3 in `final-2`).
+- *`SortedList._check` (2 bugs).* `_check` is a private consistency check that no public behaviour
+  depends on; testing it would mean calling a private method, which our rules forbid because such
+  tests are fragile and often false alarms.
+- *`final-2` also missed the TLRU expiry boundary `__init__-594`.* No tool reaches it; only a
+  model-written two-observer test at the exact expiry time finds it, and in `final-2` the model spent
+  its turns on other units. This is the run-to-run variance of the model's own part.

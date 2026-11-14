@@ -60,6 +60,24 @@ def _far(*args):
     return (nums[-1] if nums else 0) + 10
 
 
+def _tvar(key, value, now):
+    # time-to-use that depends on the value: values v with v % 3 == 1 expire the moment they are stored
+    return now + ((value + 2) % 3) * 5
+
+
+class _Lock:
+    def __init__(self):
+        self.held = 0
+
+    def __enter__(self):
+        self.held += 1
+        return self
+
+    def __exit__(self, *exc):
+        self.held -= 1
+        return False
+
+
 _MISS = object()
 
 
@@ -137,9 +155,13 @@ def _cons_map(m, probe):
         assert sz <= mx, f"currsize {sz} > maxsize {mx}"
 
 
-def _c_set(m, k, v, probe):
+def _c_set(m, k, v, probe, strict=True):
+    live = [o for o in probe if o != k and o in m]
     r = _outcome(lambda: m.__setitem__(k, v))
-    if r[0] == "ok":
+    if not strict and v % 3 == 1:
+        # an item that expires the moment it is stored needs no room: nothing live may be evicted for it
+        assert all(o in m for o in live), f"m[{k}] = {v} (already expired) evicted {[o for o in live if o not in m]}"
+    if r[0] == "ok" and strict:
         assert k in m, f"{k} missing right after m[{k}] = {v}"
         assert m[k] == v, f"m[{k}] is {m[k]} right after m[{k}] = {v}"
     _cons_map(m, probe)
@@ -300,6 +322,8 @@ def _param_options(p: inspect.Parameter, big: bool) -> list[str | None]:
         return ["clock"]
     if "ttl" in n or "timeout" in n or "expire" in n:
         return ["10"]
+    if "ttu" in n and not has_default:
+        return ["_far", "_tvar"]
     if n == "key":
         return [None, "_neg", "_half"] if has_default else ["_neg", "_half"]
     if isinstance(d, bool) or n in ("typed",):
@@ -426,14 +450,35 @@ def classify(path: str, cls, modules: set) -> list[Target]:
             t = _classify_obj(path, ctor, obj, ns, big)
             if t:
                 targets.append(t)
+    pol = _policy(cls)
+    if pol:
+        for t in list(targets):
+            if t.kind == "map-cons" and not t.extra.get("clock") and "_" not in t.ctor.split("(", 1)[1]:
+                targets.insert(0, Target(path, "map-policy", t.ctor, None, None, extra={"regime": "policy", "policy": pol}))
+                break
     # keep a few distinct variants per class and kind
     out, seen = [], set()
     for t in targets:
-        k = (t.kind, t.key, t.ordered, "[" in t.ctor and "5, 1" in t.ctor, t.extra.get("regime"))
+        k = (t.kind, t.key, t.ordered, "[" in t.ctor and "5, 1" in t.ctor, t.extra.get("regime"), t.extra.get("lenient"))
         if k not in seen:
             seen.add(k)
             out.append(t)
     return out[:6]
+
+
+POLICIES = (("least frequently used", "lfu"), ("least recently used", "lru"),
+            ("first in, first out", "fifo"), ("first in first out", "fifo"), ("first-in, first-out", "fifo"))
+
+
+def _policy(cls) -> str | None:
+    """The eviction policy the class's own docstring names (time-aware variants are left out)."""
+    doc = (inspect.getdoc(cls) or "").split("\n\n")[0].lower()
+    if "time" in doc:
+        return None
+    for phrase, kind in POLICIES:
+        if phrase in doc:
+            return kind
+    return None
 
 
 def _try(f):
@@ -466,7 +511,8 @@ def _classify_obj(path, ctor, obj, ns, big):
             return None
         if not big:
             return Target(path, "map-cons", ctor, None, None, extra={"regime": "cons", "clock": uses_clock,
-                                                                    "methods": _zero_arg_methods(obj)})
+                                                                    "methods": _zero_arg_methods(obj),
+                                                                    "lenient": "_tvar" in ctor})
         return None
     if has("add", "__contains__", "__iter__", "__len__") and (has("discard") or has("remove")):
         fresh = _try(lambda: _eval(ctor, ns))
@@ -565,7 +611,7 @@ def ops_map_cons(t: Target, r: random.Random) -> str:
         opts += ["clear"]
     c = r.choice(opts)
     if c == "set":
-        return f"_c_set(m, {k}, {v}, range(8))"
+        return f"_c_set(m, {k}, {v}, range(8){', strict=False' if t.extra.get('lenient') else ''})"
     if c == "get":
         return f"_c_get(m, {k}, range(8))"
     if c == "del":
@@ -582,6 +628,13 @@ def ops_map_cons(t: Target, r: random.Random) -> str:
         return f"clock.t += {r.choice([1, 1, 4, 5, 10, 10])}"
     name = r.choice(t.extra["methods"])
     return f"_outcome(lambda: m.{name}())\n_cons_map(m, range(8))"
+
+
+def ops_map_policy(t: Target, r: random.Random) -> str:
+    k = r.randrange(6)
+    c = r.choice(["set", "set", "get", "get", "get", "get", "del", "popitem"])
+    return {"set": f"p.set({k}, {r.randrange(100)})", "get": f"p.get({k})", "del": f"p.delete({k})",
+            "popitem": "p.popitem()"}[c]
 
 
 def ops_seq_sorted(t: Target, r: random.Random) -> str:
@@ -602,6 +655,11 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
                 f"'update(range({lo}, {lo + n}))')")
         return bulk + "\n" + _sweep(t, r, lo, lo + n) + f"\n_check_seq(s, ref, {K}, range(8))"
     c = r.choice(opts)
+    focus = getattr(r, "focus", None)
+    if focus in opts:
+        # focused program: only growth and one kind of operation, so a bug in some other operation
+        # cannot stop the program before this one is exercised
+        c = focus if r.random() < 0.5 else r.choice(["add", "update"])
     code = {
         "add": f"_same(lambda: s.add({x}), lambda: _ins(ref, {K}, {x}), 'add({x})')",
         "discard": f"_same(lambda: s.discard({x}), lambda: _disc(ref, {x}), 'discard({x})')",
@@ -655,8 +713,11 @@ def _sweep(t: Target, r: random.Random, lo: int, hi: int) -> str:
     if kind == "index" and K in ("None", "_ident"):
         a, b = r.choice([(None, None), (-r.randrange(1, 900), None), (r.randrange(0, 900), -r.randrange(1, 900)),
                          (-r.randrange(900, 3000), -r.randrange(1, 50))])
+        rargs = "".join(f", {x}" for x in ((a, b) if b is not None else ((a,) if a is not None else ())))
+        if a is None and b is not None:
+            rargs = f", 0, {b}"
         return (f"for _v in {vals}:\n    if hasattr(s, 'index'):\n"
-                f"        _same(lambda: s.index(_v, {a}, {b}), lambda: ref.index(_v, {a}, {b}), f'index({{_v}}, {a}, {b})')")
+                f"        _same(lambda: s.index(_v, {a}, {b}), lambda: ref.index(_v{rargs}), f'index({{_v}}, {a}, {b})')")
     if kind == "irange":
         w = r.randrange(1, 1200)
         a = lo + r.randrange(0, hi - lo)
@@ -748,6 +809,67 @@ def _spop(ref, i, key):
     ref.remove(v)
     return v
 '''
+HELPERS += r'''
+
+class _Pol:
+    """Tracks the uses of a cache whose documentation names its eviction policy; checks each eviction."""
+
+    def __init__(self, m, kind):
+        self.m, self.kind, self.t = m, kind, 0
+        self.uses, self.last, self.born = {}, {}, {}
+
+    def _touch(self, k):
+        self.t += 1
+        self.uses[k] = self.uses.get(k, 0) + 1
+        self.last[k] = self.t
+
+    def _gone(self, before, why):
+        gone = [e for e in before if e not in self.m]
+        rest = [o for o in before if o not in gone]
+        for e in gone:
+            if rest and self.kind == "lfu":
+                assert self.uses[e] <= min(self.uses[o] for o in rest), \
+                    f"{why}: evicted {e} (used {self.uses[e]}x) but {[(o, self.uses[o]) for o in rest]} remain"
+            if rest and self.kind == "lru":
+                assert self.last[e] <= min(self.last[o] for o in rest), \
+                    f"{why}: evicted {e}, which is not the least recently used of {before}"
+            if rest and self.kind == "mru":
+                assert self.last[e] >= max(self.last[o] for o in rest), \
+                    f"{why}: evicted {e}, which is not the most recently used of {before}"
+            if rest and self.kind == "fifo":
+                assert self.born[e] <= min(self.born[o] for o in rest), \
+                    f"{why}: evicted {e}, which is not the oldest of {before}"
+            for d in (self.uses, self.last, self.born):
+                d.pop(e, None)
+
+    def set(self, k, v):
+        if k in self.m:
+            return          # keys are only stored while absent, so every key has been set once
+        before = list(self.m)
+        self.m[k] = v
+        self._gone(before, f"m[{k}] = {v}")
+        if k in self.m:
+            self._touch(k)
+            self.born[k] = self.t
+
+    def get(self, k):
+        if k in self.m:
+            self.m[k]
+            self._touch(k)
+
+    def delete(self, k):
+        if k in self.m:
+            del self.m[k]
+            for d in (self.uses, self.last, self.born):
+                d.pop(k, None)
+
+    def popitem(self):
+        before = list(self.m)
+        if before:
+            self.m.popitem()
+            self._gone(before, "popitem()")
+'''
+
 _H.clear()
 exec(compile(HELPERS, "<contracts-helpers>", "exec"), _H)
 
@@ -760,6 +882,8 @@ def prelude(t: Target) -> list[str]:
         lines.append(f"m = {t.ctor}")
         if t.kind == "map-ref":
             lines.append("ref = {}")
+        if t.kind == "map-policy":
+            lines.append(f"p = _Pol(m, {t.extra['policy']!r})")
     elif t.kind == "seq-sorted":
         lines.append(f"s = {t.ctor}")
         lines.append(f"ref = _sorted({_INIT!r}, {t.key})" if t.extra.get("init") else "ref = []")
@@ -769,7 +893,7 @@ def prelude(t: Target) -> list[str]:
     return lines
 
 
-GEN = {"map-ref": ops_map_ref, "map-cons": ops_map_cons, "seq-sorted": ops_seq_sorted,
+GEN = {"map-ref": ops_map_ref, "map-cons": ops_map_cons, "map-policy": ops_map_policy, "seq-sorted": ops_seq_sorted,
        "set-sorted": ops_set, "set-plain": ops_set}
 
 
@@ -864,6 +988,55 @@ def memo_program(path: str, form: dict, r: random.Random, stdlib_name: bool) -> 
     return chunks
 
 
+def _method_memo_forms(path: str, fn) -> list[dict]:
+    """Decorators for methods whose cache (and lock) are given as functions of self."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return []
+    names = list(params)
+    if not names or "cache" not in names[0].lower():
+        return []
+    forms = []
+    for store in ("{}", "None"):
+        for lock in ([""] + ([", lock=lambda self: self.lk"] if "lock" in params else [])):
+            forms.append({"code": f"{path}(lambda self: self.store{lock})", "store": store})
+    good = []
+    for form in forms:
+        code = _method_head(form) + "\nassert o.f(1) == 10 and o.f(1) == 10\n"
+        if _run(_imports([path]) + code) is None:
+            form["clear"] = _run(_imports([path]) + code + "assert callable(_Obj.f.cache_clear)\n") is None
+            good.append(form)
+    return good
+
+
+def _method_head(form: dict) -> str:
+    return ("class _Obj:\n"
+            f"    def __init__(self):\n        self.store = {form['store']}\n        self.calls = []\n        self.lk = _Lock()\n"
+            f"    @{form['code']}\n"
+            "    def f(self, x):\n        self.calls.append(x)\n        return x * 10\n"
+            "o = _Obj()\n_seen = set()")
+
+
+def method_memo_program(form: dict, r: random.Random) -> list[str]:
+    chunks = [_method_head(form)]
+    cached = form["store"] != "None"
+    for _ in range(r.randrange(3, 12)):
+        x = r.randrange(5)
+        if form.get("clear") and r.random() < 0.25:
+            chunks.append("_Obj.f.cache_clear(o)\n_seen.clear()\no.calls.clear()\n"
+                          + ("assert len(o.store) == 0, f'cache_clear left {dict(o.store)}'\n" if cached else "")
+                          + "assert o.lk.held == 0, 'lock still held after cache_clear'")
+            continue
+        chunks.append(f"assert o.f({x}) == {x * 10}, 'o.f({x})'\n"
+                      + (f"_seen.add({x})\nassert len(o.calls) == len(_seen), "
+                         f"f'method ran {{len(o.calls)}} times for {{len(_seen)}} distinct arguments since the last clear'\n"
+                         if cached else
+                         f"assert o.calls[-1] == {x}, 'with no cache the method must run on every call'\n")
+                      + "assert o.lk.held == 0, 'lock still held after a call'")
+    return chunks
+
+
 def hash_program(path: str, r: random.Random, lo: int = 0) -> list[str]:
     chunks = []
     for _ in range(r.randrange(2, 6)):
@@ -939,6 +1112,18 @@ def ddmin(head: str, chunks: list[str], sig: str, head_chunks: int = 0, until: f
     return fixed + items
 
 
+FOCUS = ["discard", "remove", "pop", "popi", "delitem", "delslice", "islice", "irange_none", "iadd", "add_op",
+         "mul", "cmp", "index_range"]
+
+
+def _program(t: Target, gen, r: random.Random) -> list[str]:
+    r.focus = r.choice(FOCUS) if r.random() < 0.4 else None
+    try:
+        return [gen(t, r) for _ in range(r.randrange(4, 16))]
+    finally:
+        r.focus = None
+
+
 def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int = 60, long: int = 0, span: int = 8) -> dict:
     r = random.Random(seed)
     stdlib = set(dir(functools))
@@ -962,7 +1147,7 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
                 stats["targets"].append(f"{t.kind}:{t.ctor}:{t.key}")
                 gen = GEN[t.kind]
                 head = _imports([path]) + "\n".join(prelude(t)) + "\n"
-                jobs.append((f"{t.kind}:{t.name()}", head, (lambda rr, t=t, gen=gen: [gen(t, rr) for _ in range(rr.randrange(4, 16))]), 0))
+                jobs.append((f"{t.kind}:{t.name()}", head, (lambda rr, t=t, gen=gen: _program(t, gen, rr)), 0))
         elif inspect.isfunction(obj):
             forms = _memo_forms(path, obj)
             std = path.rsplit(".", 1)[-1] in stdlib
@@ -971,7 +1156,12 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
                 stats["targets"].append(f"memo:{form['code']}")
                 head = _imports([path])
                 jobs.append((f"memo:{path}", head, (lambda rr, form=form, std=std, path=path: memo_program(path, form, rr, std)), 1))
-            if not forms and _hash_ok(path):
+            mforms = [] if forms else _method_memo_forms(path, obj)
+            for form in mforms:
+                stats["targets"].append(f"memo-method:{form['code']}:{form['store']}")
+                head = _imports([path])
+                jobs.append((f"memo-method:{path}", head, (lambda rr, form=form: method_memo_program(form, rr)), 1))
+            if not forms and not mforms and _hash_ok(path):
                 stats["targets"].append(f"hash:{path}")
                 head = _imports([path])
                 lo = _min_positional(obj)

@@ -25,12 +25,14 @@ import inspect
 import itertools
 import json
 import pkgutil
+import re
 import random
 import signal
 import sys
 import time
 import types
 from collections import abc
+from pathlib import Path
 
 # ---------------------------------------------------------------------------------------------------
 # Helpers that are copied verbatim to the top of the generated test file (and exec'd while fuzzing).
@@ -88,6 +90,27 @@ def _outcome(f):
         return ("raises", type(e).__name__)
 
 
+# exceptions that mean the code itself broke, not that the call was refused
+_CRASH = ("TypeError", "AttributeError", "NameError", "UnboundLocalError")
+
+
+def _no_crash(f, what):
+    o = _outcome(f)
+    assert not (o[0] == "raises" and o[1] in _CRASH), f"{what} raised {o[1]}"
+    return o
+
+
+# the project's own invariant self-check methods (the ones its test suite calls after operations)
+_SELF = []
+
+
+def _self_check(obj):
+    for n in _SELF:
+        f = getattr(obj, n, None)
+        if callable(f):
+            f()
+
+
 def _same(f, g, what):
     a, b = _outcome(f), _outcome(g)
     assert a == b, f"{what}: got {a!r}, reference {b!r}"
@@ -123,6 +146,7 @@ def _bis(ref, key, x, side):
 
 
 def _check_map(m, ref, key, ordered, probe):
+    _self_check(m)
     assert len(m) == len(ref), f"len {len(m)} != {len(ref)}"
     ks = list(m)
     if ordered:
@@ -138,6 +162,7 @@ def _check_map(m, ref, key, ordered, probe):
 
 
 def _cons_map(m, probe):
+    _self_check(m)
     # per-key observers first: aggregate ones (len, currsize) may clean up stale entries
     for k in probe:
         a = k in m
@@ -217,6 +242,7 @@ def _c_clear(m, probe):
 
 
 def _check_seq(s, ref, key, probe):
+    _self_check(s)
     if key is _half:
         # equal keys: the order among equal-key values is unspecified, so compare keys and contents only
         assert [key(v) for v in s] == sorted(key(v) for v in ref), f"key order {list(s)}"
@@ -253,6 +279,7 @@ def _check_seq(s, ref, key, probe):
 
 
 def _check_set(s, ref, key, ordered, probe):
+    _self_check(s)
     if ordered:
         assert list(s) == sorted(ref, key=key), f"contents {list(s)}"
     else:
@@ -554,6 +581,13 @@ def _zero_arg_methods(obj) -> list[str]:
         params = [p for p in sig.parameters.values() if p.name != "self"]
         if all(p.default is not inspect.Parameter.empty or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
                for p in params):
+            # the signature can hide required arguments (wrappers, *args): the call must work on a fresh object
+            try:
+                getattr(obj, name)()
+            except (TypeError, AttributeError, NameError):
+                continue
+            except Exception:  # noqa: BLE001 - refusing the call (KeyError on an empty cache) is fine
+                pass
             out.append(name)
     return out[:4]
 
@@ -627,7 +661,7 @@ def ops_map_cons(t: Target, r: random.Random) -> str:
     if c == "tick":
         return f"clock.t += {r.choice([1, 1, 4, 5, 10, 10])}"
     name = r.choice(t.extra["methods"])
-    return f"_outcome(lambda: m.{name}())\n_cons_map(m, range(8))"
+    return f"_no_crash(lambda: m.{name}(), '{name}()')\n_cons_map(m, range(8))"
 
 
 def ops_map_policy(t: Target, r: random.Random) -> str:
@@ -1124,6 +1158,27 @@ def _program(t: Target, gen, r: random.Random) -> list[str]:
         r.focus = None
 
 
+SELF_NAME = re.compile(r"\.(_?(?:check|validate|verify|check_invariants?|assert_invariants?|invariants?))\(\)")
+
+
+def self_check_names(root: Path | None = None) -> list[str]:
+    """No-argument invariant self-checks that the project's own test suite calls on its objects
+    (e.g. `obj._check()` after every operation). The fuzzer calls them after each step too."""
+    import collections
+    counts = collections.Counter()
+    folder = (root or Path.cwd()) / "tests"
+    try:
+        files = sorted(folder.rglob("*.py"))[:400]
+    except OSError:
+        return []
+    for f in files:
+        try:
+            counts.update(SELF_NAME.findall(f.read_text(errors="ignore")))
+        except OSError:
+            continue
+    return [n for n, c in counts.most_common(3) if c >= 3]
+
+
 def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int = 60, long: int = 0, span: int = 8) -> dict:
     r = random.Random(seed)
     stdlib = set(dir(functools))
@@ -1134,6 +1189,7 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
     except Exception as e:  # noqa: BLE001
         return {"tests": [], "stats": {"error": f"{type(e).__name__}: {e}"}}
     t0 = time.time()
+    selfs = self_check_names()
     jobs = []   # (label, head, chunk generator)
     for path, obj in objs:
         if time.time() - t0 > deadline * 0.3:
@@ -1147,6 +1203,12 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
                 stats["targets"].append(f"{t.kind}:{t.ctor}:{t.key}")
                 gen = GEN[t.kind]
                 head = _imports([path]) + "\n".join(prelude(t)) + "\n"
+                if selfs:
+                    obj_name = "m" if t.kind.startswith("map") else "s"
+                    ok = [n for n in selfs if _run(head + f"_SELF[:] = [{n!r}]\n_self_check({obj_name})\n") is None]
+                    if ok:
+                        head += f"_SELF[:] = {ok!r}\n"
+                        stats["targets"].append(f"self-check:{t.name()}:{','.join(ok)}")
                 jobs.append((f"{t.kind}:{t.name()}", head, (lambda rr, t=t, gen=gen: _program(t, gen, rr)), 0))
         elif inspect.isfunction(obj):
             forms = _memo_forms(path, obj)

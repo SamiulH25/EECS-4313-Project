@@ -53,13 +53,40 @@ part.
 
 ## 4. Evidence that a technique finds new bugs
 
-(pending: filled in from the record runs `final-1/2`, `no-contracts-1/2`, `no-filter-1/2`, `starter`.)
+Record runs on the course settings; each ablation switches one technique off in the agent's tools
+(`scripts/make_variant.sh`) and was run twice.
+
+**Model-based fuzzing.** `python -m testagent.compare --run final-1 --against no-contracts-1` reports
+25 bugs that only `final-1` found and 0 that only `no-contracts-1` found (the same holds against
+`no-contracts-2`). Without the fuzzer the model alone found 7/40 (0 on cachetools); with it, 32/40.
+Examples: `func-47`/`func-61` (memoiser cache-info counters, found by comparing `cached` with
+`functools.lru_cache`) and `sortedlist-1943`/`-1994` (`irange`/`islice` bounds, found only by bulk inserts
+past the internal block size followed by range sweeps).
+
+**Mutation-based repair check.** Without it (`no-filter-1`, `no-filter-2`) every failing test is kept:
+29/40 and 30/40 bugs but 66 and 22 false alarms (scores −4.0 and 19.0), against 32/40 with 0 false
+alarms. `compare --run final-1 --against no-filter-1` shows 3 bugs only `final-1` found
+(`__init__-594`, `__init__-670`, `sortedlist-1994`) and 0 the other way round: the filter costs no
+recall, and the confirmed repairs it accepts let later fuzz passes look past bugs already found.
+
+**The model's own tests.** Per-file attribution of `final-1` (dev script `scripts/attribute.py`) shows
+the TLRU expiry bug `__init__-594` was found only by a model-written test
+(`test_u09_tlrucache_expire.py`), and the model's `prop_`/example files also re-found 9 other bugs.
+Doctest mining alone found `sorteddict-447`, `sorteddict-483` and `sortedlist-411`.
 
 ## 5. Results on the development projects
 
-Course settings (`settings.course.yaml`).
+Course settings (`settings.course.yaml`), both dev projects (20 bugs each).
 
-(pending: filled in from the record runs.)
+| Run | cachetools | sortedcontainers | Total | False alarms | Score | Tokens per project |
+|---|---|---|---|---|---|---|
+| starter | 0 | 0 | 0/40 | 4 | −2.0 | — |
+| **final-1** | 16 | 16 | 32/40 | 0 | **32.0** | ~391k |
+| **final-2** | 15 | 16 | 31/40 | 0 | **31.0** | ~391k |
+| no-contracts-1 / -2 | 0 / 0 | 7 / 7 | 7/40 | 0 | 7.0 / 7.0 | |
+| no-filter-1 / -2 | 14 / 15 | 15 / 15 | 29 / 30 | 66 / 22 | −4.0 / 19.0 | |
+
+The submitted run is `final-1`.
 
 ## 6. What you tried
 
@@ -105,20 +132,22 @@ survives only if a single small code change explains it. That change must keep t
 tests and every passing generated test green, and must not contradict the code's own conventions or a
 documented number.
 
-**2. Where to look.** The agent never puts the whole project in context. Static analysis splits it
-into units and ranks them. Ranking uses the number of risk points, lines that deviate from similar code,
-and parameter defaults that differ between sibling functions. Coverage from earlier rounds then points
-the model at branches nobody has reached.
+**2. Where to look.** The agent never puts the whole project in context. `survey` splits it into units
+and ranks them by risk points (lines that deviate from similar code, parameter defaults that differ
+between siblings), fuzzer coverage and earlier results. `unit <id> <method>` shows one method with its
+risk points and the branches no test has reached yet. The model chooses from that report, and is
+told to move on after a unit has a confirmed bug or two files that found nothing.
 
 **3. Keeping false alarms down.**
 - Passing tests are dropped, since they find nothing and may encode bugs.
 - Tests that crash in the test code, read private state, or are flaky over two orders are dropped.
-- Every remaining test must pass the repair check (section 2.5).
+- Every remaining test must pass the repair check (section 3).
 - The sibling rules reject repairs that would introduce a deviation, e.g. moving `timer() < expires`
   to `<=` when the other expiry checks are strict.
 - At most 2 tests per repaired location.
 
-False alarms went from 140 (LLM judge) to 0–1 per full run.
+False alarms went from 140 (LLM judge) to 0 in every run of the final agent; without the repair check
+the same agent keeps 22–66 (section 4).
 
 **4. Generalisation.** Nothing refers to a project, file or bug. Every rule is a general property of
 code: a single-site injected bug, internal consistency, documented numbers, documented examples. Rules
@@ -128,13 +157,12 @@ dev sets but judged changes by false alarms and by whether real detectors were k
 dev-only oracle script (`scripts/cand_oracle.py`, not part of the agent) reports this; we did not use
 the bug list to steer generation.
 
-**5. Bugs we still miss.**
-- *`func.py` default `maxsize=128` changed to 127/129 (6 bugs).* They are only reached when a decorator
-  is used bare (`@lru_cache`). The docs explain this, but in every run the model wrote
-  `lru_cache(maxsize=lambda x: ...)` or invented a `callable=` argument. The trajectories show
-  `TypeError ... takes 0 positional arguments`. The tests crash in the test code and are dropped,
-  correctly, and the crash-repair call rarely finds the right form.
-- *TTL/TLRU `__setitem__`/`__delitem__` boundary `<` → `<=`.* The model keeps asserting that an item is
-  still valid exactly at its expiry time. The repair check rejects those repairs (the sibling boundary
-  rule), so we avoid the false alarm. But the model seldom writes the two-observer test (`k in c` vs
-  `del c[k]` at the boundary) that would catch these bugs.
+**5. Bugs we still miss** (8 in `final-1`).
+- *`SortedList.index` start/stop adjustment `+=` → `-=` (2 bugs) and `SortedList._check` (2 bugs).*
+  `index` with negative `start`/`stop` is fuzzed, but these lines are only reached with offsets that
+  the shrinker removes, and `_check` is a private consistency check no public behaviour depends on.
+- *`cachedmethod` `clear` `is not` → `is` (2 bugs).* The docs barely describe `cache_clear` on
+  methods, so neither the fuzzer nor the model has an oracle there.
+- *TLRU `__setitem__` boundary `<` → `<=` and `LFUCache.__getitem__` `-=` → `+=`.* The model rarely
+  writes the two-observer test at the expiry boundary; the LFU counter bug was found by the
+  unfiltered run once, so it is reachable, but our filtered runs did not keep such a test.

@@ -146,7 +146,6 @@ def _bis(ref, key, x, side):
 
 
 def _check_map(m, ref, key, ordered, probe):
-    _self_check(m)
     assert len(m) == len(ref), f"len {len(m)} != {len(ref)}"
     ks = list(m)
     if ordered:
@@ -162,7 +161,6 @@ def _check_map(m, ref, key, ordered, probe):
 
 
 def _cons_map(m, probe):
-    _self_check(m)
     # per-key observers first: aggregate ones (len, currsize) may clean up stale entries
     for k in probe:
         a = k in m
@@ -242,7 +240,6 @@ def _c_clear(m, probe):
 
 
 def _check_seq(s, ref, key, probe):
-    _self_check(s)
     if key is _half:
         # equal keys: the order among equal-key values is unspecified, so compare keys and contents only
         assert [key(v) for v in s] == sorted(key(v) for v in ref), f"key order {list(s)}"
@@ -279,7 +276,6 @@ def _check_seq(s, ref, key, probe):
 
 
 def _check_set(s, ref, key, ordered, probe):
-    _self_check(s)
     if ordered:
         assert list(s) == sorted(ref, key=key), f"contents {list(s)}"
     else:
@@ -425,7 +421,14 @@ def _run(code: str, seconds: float = 2.0):
     except RecursionError:
         return ("RecursionError", "")
     except BaseException as e:  # noqa: BLE001
-        return (type(e).__name__, str(e).split("\n")[0][:200])
+        msg = str(e).split("\n")[0][:200]
+        if not msg and isinstance(e, AssertionError):
+            tb = e.__traceback__
+            while tb.tb_next:
+                tb = tb.tb_next
+            # a bare assert in the library (an invariant self-check): tell failures apart by the line
+            msg = "invariant at line " + "".join(chr(97 + int(c)) for c in str(tb.tb_lineno))
+        return (type(e).__name__, msg)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
 
@@ -723,6 +726,45 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
     if t.key == "_neg" and c in ("add_op", "mul"):
         code = "pass"
     return code + f"\n_check_seq(s, ref, {K}, range(8))"
+
+
+def ops_self(t: Target, r: random.Random, positional: bool = False) -> str:
+    """One operation (its outcome ignored) followed by the project's own invariant self-check:
+    the self-check is the oracle, so a bug in the operation's result cannot hide a broken state."""
+    o = "m" if t.kind.startswith("map") else "s"
+    x, i = r.randrange(8), r.choice([r.randrange(-6, 6), r.randrange(-4000, 4000)])
+    a, b = r.randrange(-5, 6), r.randrange(-5, 7)
+    lo, n = r.randrange(0, 60), r.choice([3, 10, 200, 700, 1500, 2600])
+    if o == "m":
+        ops = [f"{o}.__setitem__({x}, {r.randrange(100)})", f"{o}.update((k, k) for k in range({lo}, {lo + n}))",
+               f"{o}.__delitem__({x})", f"{o}.pop({x})", f"{o}.popitem()", f"{o}.peekitem({i})", f"{o}.popitem({i})",
+               f"list({o}.keys())[{i}]", f"{o}.keys()[{i}]", f"{o}.keys().__delitem__({i})", f"{o}.setdefault({x}, {x})",
+               f"{o}.clear()", f"list({o})"]
+    else:
+        ops = [f"{o}.add({x})", f"{o}.update(range({lo}, {lo + n}))", f"{o}.discard({x})", f"{o}.remove({x})",
+               f"{o}.pop({i})", f"{o}.pop()", f"{o}[{i}]", f"{o}.__delitem__({i})", f"{o}.__delitem__(slice({a}, {b}))", f"{o}.clear()",
+               f"{o}.index({x})", f"{o}.bisect_left({x})", f"list({o}.islice({abs(a)}, {abs(b)}))",
+               f"{o}.discard({lo + r.randrange(max(1, n))})", f"{o}.__delitem__(slice({lo % 7}, {lo % 7 + r.randrange(1, 900)}))"]
+    if positional:
+        ops = [op for op in ops if f"{o}[" in op or "__delitem__" in op or "pop(" in op or "peekitem" in op
+               or "islice" in op or "index" in op] or ops
+    weights = [3 if "update" in op else 1 for op in ops]
+    op = r.choices(ops, weights)[0]
+    return f"_outcome(lambda: {op})\n_self_check({o})"
+
+
+def self_program(t: Target, r: random.Random) -> list[str]:
+    """Self-check programs: internal invariants usually concern large objects (several internal blocks,
+    lazily built indexes), so most start by growing the object past a few thousand elements and then
+    favour positional operations, which build those indexes."""
+    chunks = []
+    if r.random() < 0.7:
+        o = "m" if t.kind.startswith("map") else "s"
+        lo, n = r.randrange(0, 60), r.choice([300, 1500, 2600, 4100, 6500])
+        grow = (f"{o}.update((k, k) for k in range({lo}, {lo + n}))" if o == "m" else f"{o}.update(range({lo}, {lo + n}))")
+        chunks.append(f"_outcome(lambda: {grow})\n_self_check({o})")
+    chunks += [ops_self(t, r, positional=r.random() < 0.6) for _ in range(r.randrange(2, 10))]
+    return chunks
 
 
 BIG_P = 0.08
@@ -1190,6 +1232,7 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
         return {"tests": [], "stats": {"error": f"{type(e).__name__}: {e}"}}
     t0 = time.time()
     selfs = self_check_names()
+    self_done = set()
     jobs = []   # (label, head, chunk generator)
     for path, obj in objs:
         if time.time() - t0 > deadline * 0.3:
@@ -1203,12 +1246,13 @@ def fuzz(pkg: str, deadline: float, seed: int, per_sig: int = 2, max_tests: int 
                 stats["targets"].append(f"{t.kind}:{t.ctor}:{t.key}")
                 gen = GEN[t.kind]
                 head = _imports([path]) + "\n".join(prelude(t)) + "\n"
-                if selfs:
+                if selfs and t.name() not in self_done:
+                    self_done.add(t.name())
                     obj_name = "m" if t.kind.startswith("map") else "s"
                     ok = [n for n in selfs if _run(head + f"_SELF[:] = [{n!r}]\n_self_check({obj_name})\n") is None]
                     if ok:
-                        head += f"_SELF[:] = {ok!r}\n"
-                        stats["targets"].append(f"self-check:{t.name()}:{','.join(ok)}")
+                        shead = head + f"_SELF[:] = {ok!r}\n"
+                        jobs.append((f"self-check:{t.name()}", shead, (lambda rr, t=t: self_program(t, rr)), 0))
                 jobs.append((f"{t.kind}:{t.name()}", head, (lambda rr, t=t, gen=gen: _program(t, gen, rr)), 0))
         elif inspect.isfunction(obj):
             forms = _memo_forms(path, obj)

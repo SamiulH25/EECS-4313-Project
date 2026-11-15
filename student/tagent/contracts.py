@@ -692,6 +692,8 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
     xs = [r.randrange(8) for _ in range(r.randrange(1, 4))]
     i = r.randrange(-6, 6)
     a, b = r.randrange(-5, 6), r.randrange(-5, 7)
+    # start/stop: each sign combination equally often (negative bounds are adjusted by the length)
+    ia, ib = r.choice([r.randrange(0, 4), -r.randrange(1, 7)]), r.choice([r.randrange(1, 9), -r.randrange(1, 6)])
     opts = ["add", "add", "add", "discard", "remove", "update", "pop", "popi", "delitem", "delslice", "clear",
             "islice", "irange_none", "iadd", "add_op", "mul", "cmp", "index_range"]
     if K == "_half":
@@ -719,9 +721,9 @@ def ops_seq_sorted(t: Target, r: random.Random) -> str:
         "delitem": f"_same(lambda: s.__delitem__({i}), lambda: ref.__delitem__({i}), 'del s[{i}]')",
         "delslice": f"_same(lambda: s.__delitem__(slice({a}, {b})), lambda: ref.__delitem__(slice({a}, {b})), 'del s[{a}:{b}]')",
         "clear": "_same(lambda: s.clear(), lambda: ref.clear(), 'clear()')",
-        "index_range": (f"if hasattr(s, 'index'):\n    _same(lambda: s.index({x}, {a}, {b}), "
-                        f"lambda: ref.index({x}, {a}, {b}), 'index({x}, {a}, {b})')\n"
-                        f"    _same(lambda: s.index({x}, {a}), lambda: ref.index({x}, {a}), 'index({x}, {a})')"),
+        "index_range": (f"if hasattr(s, 'index'):\n    _same(lambda: s.index({x}, {ia}, {ib}), "
+                        f"lambda: ref.index({x}, {ia}, {ib}), 'index({x}, {ia}, {ib})')\n"
+                        f"    _same(lambda: s.index({x}, {ia}), lambda: ref.index({x}, {ia}), 'index({x}, {ia})')"),
         "islice": (f"if hasattr(s, 'islice'):\n    _same(lambda: list(s.islice({abs(a)}, {abs(b)})), "
                    f"lambda: ref[{abs(a)}:{abs(b)}], 'islice({abs(a)}, {abs(b)})')\n"
                    f"    _same(lambda: list(s.islice({abs(a)}, {abs(b)}, reverse=True)), "
@@ -779,6 +781,19 @@ def self_program(t: Target, r: random.Random) -> list[str]:
     """Self-check programs: internal invariants usually concern large objects (several internal blocks,
     lazily built indexes), so most start by growing the object past a few thousand elements and then
     favour positional operations, which build those indexes."""
+    o = "m" if t.kind.startswith("map") else "s"
+    if r.random() < 0.5:
+        # size sweep: grow (then shrink) step by step, touching a middle position and checking the
+        # invariants at every size, so every internal layout is visited whatever the other code does
+        step, n = r.choice([37, 101, 250, 433]), r.choice([3000, 6000, 9000])
+        add = f"{o}.update((k, k) for k in range(_n, _n + {step}))" if o == "m" else f"{o}.update(range(_n, _n + {step}))"
+        mid = f"{o}.peekitem(len({o}) // 2)" if o == "m" else f"{o}[len({o}) // 2]"
+        grow = (f"for _n in range(0, {n}, {step}):\n    _outcome(lambda: {add})\n    _outcome(lambda: {mid})\n"
+                f"    _self_check({o})")
+        cut = f"{o}.popitem(len({o}) // 3)" if o == "m" else f"{o}.__delitem__(slice(len({o}) // 3, len({o}) // 3 + {step}))"
+        shrink = (f"for _n in range({n} // {step}):\n    _outcome(lambda: {cut})\n    _outcome(lambda: {mid})\n"
+                  f"    _self_check({o})")
+        return [grow] + ([shrink] if r.random() < 0.5 else [])
     chunks = []
     if r.random() < 0.7:
         o = "m" if t.kind.startswith("map") else "s"

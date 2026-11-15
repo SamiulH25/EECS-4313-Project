@@ -785,7 +785,7 @@ def self_program(t: Target, r: random.Random) -> list[str]:
     if r.random() < 0.5:
         # size sweep: grow (then shrink) step by step, touching a middle position and checking the
         # invariants at every size, so every internal layout is visited whatever the other code does
-        step, n = r.choice([37, 101, 250, 433]), r.choice([3000, 6000, 9000])
+        step, n = r.choice([37, 61, 101, 250, 433]), r.choice([7000, 9000, 12000, 15000])
         add = f"{o}.update((k, k) for k in range(_n, _n + {step}))" if o == "m" else f"{o}.update(range(_n, _n + {step}))"
         mid = f"{o}.peekitem(len({o}) // 2)" if o == "m" else f"{o}[len({o}) // 2]"
         grow = (f"for _n in range(0, {n}, {step}):\n    _outcome(lambda: {add})\n    _outcome(lambda: {mid})\n"
@@ -813,6 +813,10 @@ def _sweep(t: Target, r: random.Random, lo: int, hi: int) -> str:
     step = r.choice([1, 1, 3, 7])
     kind = r.choice(["discard", "remove", "index", "irange", "slice", "count"])
     vals = f"range({lo + r.randrange(step)}, {hi + 2}, {step})"
+    if kind in ("discard", "remove") and r.random() < 0.5:
+        # descending: the later of several equal-key values goes first, so runs of equal keys that
+        # straddle an internal block boundary are searched past that boundary
+        vals = f"range({hi + 1 - r.randrange(step)}, {lo - 1}, -{step})"
     if kind == "discard":
         return (f"for _v in {vals}:\n    s.discard(_v)\n    _disc(ref, _v)\n"
                 f"assert sorted(s) == sorted(ref) and len(s) == len(ref), f'after discard sweep: len {{len(s)}} != {{len(ref)}}'")

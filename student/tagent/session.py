@@ -195,9 +195,10 @@ class Session(Pipeline):
         return best
 
     # ------------------------------------------------------------------ the repair-check queue
-    def enqueue(self, rel: str, tests: list[TestResult], kind: str, uid: str = ""):
-        for t in tests:
-            self.pending.append({"rel": rel, "kind": kind, "uid": uid, "test": asdict(t)})
+    def enqueue(self, rel: str, tests: list[TestResult], kind: str, uid: str = "", front: bool = False):
+        new = [{"rel": rel, "kind": kind, "uid": uid, "test": asdict(t)} for t in tests]
+        # a pass with new failure kinds is checked before older leftovers
+        self.pending = new + self.pending if front else self.pending + new
 
     def drain(self, report: list[str], min_left: float = CHECK_SECONDS + 8) -> int:
         """Run the repair check on queued failing tests while the time allows. Returns tests confirmed."""
@@ -354,16 +355,26 @@ class Session(Pipeline):
             m = re.search(r"_(\d+)$", t.func)
             g = tuple(labels[int(m.group(1))]) if m and int(m.group(1)) < len(labels) else (t.func,)
             groups.setdefault(g, []).append(t)
-        picked = []
+        # failure kinds never queued in an earlier pass come first: a kind seen before is most likely a bug
+        # that is already confirmed (or waiting), so it must not crowd a new kind out of the repair check
+        seen = set(self.contract_info.setdefault("sigs", []))
+        order = sorted(groups, key=lambda g: str(g[-1]) in seen)
+        fresh = [g for g in order if str(g[-1]) not in seen]
+        picked, used = [], set()
         while len(picked) < CONTRACT_MAX_VERIFY and any(groups.values()):
-            for g in list(groups):
+            for g in order:
                 if groups[g] and len(picked) < CONTRACT_MAX_VERIFY:
                     picked.append(groups[g].pop(0))
+                    used.add(g)
+        for g in order:
+            if g in used and str(g[-1]) not in seen:
+                self.contract_info["sigs"].append(str(g[-1]))
+                seen.add(str(g[-1]))
         kinds = Counter(str(lbl[0]) for lbl in labels)
         report = [head, f"Wrote {rel}: {len(tests)} shrunk programs, {len(failing)} fail on this code "
                         f"(by target: {', '.join(f'{k} x{v}' for k, v in kinds.most_common(8))}). "
                         f"{len(picked)} queued for the repair check."]
-        self.enqueue(rel, picked, "contract")
+        self.enqueue(rel, picked, "contract", front=bool(fresh))
         self.drain(report)
         report += [self.totals(), self.queue_line()]
         if not long and len(done) < len(CONTRACT_SEEDS):
